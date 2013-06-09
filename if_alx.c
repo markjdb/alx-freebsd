@@ -2625,7 +2625,7 @@ static const struct net_device_ops alx_netdev_ops = {
 #endif
 
 static int
-alx_irq_legacy(void *arg __unused)
+alx_irq_legacy(void *arg)
 {
 	struct alx_softc *sc;
 	struct alx_hw *hw;
