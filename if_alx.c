@@ -2749,7 +2749,7 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		break;
 	}
 
-	switch (speed - (speed % 10)) {
+	switch (speed) {
 	case SPEED_10:
 		ifmr->ifm_active |= IFM_10_T;
 		break;
