@@ -198,6 +198,7 @@ struct alx_softc {
 
 	struct resource		*alx_res;
 	struct resource		*alx_irq;
+	void			*alx_cookie;
         struct ifnet		*alx_ifp;
 
 	struct taskqueue	*alx_tq;

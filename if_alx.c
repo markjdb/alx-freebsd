@@ -71,10 +71,12 @@ static struct alx_dev {
 
 #define ALX_DEV_COUNT	(sizeof(alx_devs) / sizeof(alx_devs[0]))
 
+static int	alx_allocate_legacy_irq(struct alx_softc *);
 static int	alx_attach(device_t);
 static int	alx_detach(device_t);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
+static int	alx_irq_legacy(void *);
 static int	alx_media_change(struct ifnet *);
 static void	alx_media_status(struct ifnet *, struct ifmediareq *);
 static int	alx_probe(device_t);
@@ -2623,6 +2625,58 @@ static const struct net_device_ops alx_netdev_ops = {
 #endif
 
 static int
+alx_irq_legacy(void *arg __unused)
+{
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+	uint32_t intr;
+
+	sc = arg;
+	hw = &sc->hw;
+
+	ALX_MEM_R32(hw, ALX_ISR, &intr);
+	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
+		return (FILTER_STRAY);
+
+	return (FILTER_HANDLED);
+}
+
+int
+alx_allocate_legacy_irq(struct alx_softc *sc)
+{
+	device_t dev;
+	int rid, error;
+
+	dev = sc->alx_dev;
+
+	rid = 0;
+	sc->alx_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
+	    RF_ACTIVE | RF_SHAREABLE);
+	if (sc->alx_irq == NULL) {
+		device_printf(dev, "cannot allocate IRQ\n");
+		return (ENXIO);
+	}
+
+	error = bus_setup_intr(dev, sc->alx_irq, INTR_TYPE_NET,
+	    alx_irq_legacy, NULL, sc, &sc->alx_cookie);
+	if (error != 0) {
+		device_printf(dev, "failed to register interrupt handler\n");
+		return (ENXIO);
+	}
+
+	sc->alx_tq = taskqueue_create_fast("alx_taskq", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->alx_tq);
+	if (sc->alx_tq == NULL) {
+		device_printf(dev, "could not create taskqueue\n");
+		return (ENXIO);
+	}
+	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
+	    device_get_nameunit(sc->alx_dev));
+
+	return (0);
+}
+
+static int
 alx_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 {
 	struct alx_softc *sc;
@@ -2758,14 +2812,9 @@ alx_attach(device_t dev)
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
 
-	rid = 0;
-	sc->alx_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
-	    RF_ACTIVE | RF_SHAREABLE);
-	if (sc->alx_irq == NULL) {
-		device_printf(dev, "cannot allocate IRQ\n");
-		err = ENXIO;
+	err = alx_allocate_legacy_irq(sc);
+	if (err != 0)
 		goto fail;
-	}
 
 	err = alx_init_sw(sc);
 	if (err != 0) {
@@ -2847,19 +2896,6 @@ alx_attach(device_t dev)
 		    NULL);
 	}
 	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
-
-	sc->alx_tq = taskqueue_create_fast("alx_taskq", M_WAITOK,
-	    taskqueue_thread_enqueue, &sc->alx_tq);
-	if (sc->alx_tq == NULL) {
-		device_printf(dev, "could not create taskqueue\n");
-		ether_ifdetach(ifp);
-		err = ENXIO;
-		goto fail;
-	}
-	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
-	    device_get_nameunit(sc->alx_dev));
-
-	/* Set up interrupt handlers. */
 
 #if 0
 	netdev->netdev_ops = &alx_netdev_ops;
