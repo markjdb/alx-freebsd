@@ -2656,7 +2656,7 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
 	struct alx_softc *sc;
 	struct alx_hw *hw;
-	uint16_t speed;
+	uint16_t speed, mode;
 	bool link_up;
 	int error;
 
@@ -2679,6 +2679,36 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		ifmr->ifm_status |= IFM_ACTIVE;
 	else
 		return;
+
+	mode = speed % 10;
+	speed -= mode;
+
+	switch (mode) {
+	case ALX_FULL_DUPLEX:
+		ifmr->ifm_active |= IFM_FDX;
+		break;
+	case ALX_HALF_DUPLEX:
+		ifmr->ifm_active |= IFM_HDX;
+		break;
+	default:
+		device_printf(sc->alx_dev, "invalid duplex mode %u\n", mode);
+		break;
+	}
+
+	switch (speed - (speed % 10)) {
+	case SPEED_10:
+		ifmr->ifm_active |= IFM_10_T;
+		break;
+	case SPEED_100:
+		ifmr->ifm_active |= IFM_100_TX;
+		break;
+	case SPEED_1000:
+		ifmr->ifm_active |= IFM_1000_T;
+		break;
+	default:
+		device_printf(sc->alx_dev, "invalid link speed %u\n", speed);
+		break;
+	}
 }
 
 static int

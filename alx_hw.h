@@ -371,28 +371,28 @@ struct alx_hw_stats {
 };
 
 #define SPEED_0			0
-#define HALF_DUPLEX		1
-#define FULL_DUPLEX		2
+#define ALX_HALF_DUPLEX		1
+#define ALX_FULL_DUPLEX		2
 #define ALX_MAX_SETUP_LNK_CYCLE	50
 
 #define ALX_SPEED_TO_ETHADV(_speed) (\
-(_speed) == SPEED_1000 + FULL_DUPLEX ? ADVERTISED_1000baseT_Full :	\
-(_speed) == SPEED_100 + FULL_DUPLEX ? ADVERTISED_100baseT_Full :	\
-(_speed) == SPEED_100 + HALF_DUPLEX ? ADVERTISED_10baseT_Half :		\
-(_speed) == SPEED_10 + FULL_DUPLEX ? ADVERTISED_10baseT_Full :		\
-(_speed) == SPEED_10 + HALF_DUPLEX ? ADVERTISED_10baseT_Half :		\
+(_speed) == SPEED_1000 + ALX_FULL_DUPLEX ? ADVERTISED_1000baseT_Full :	\
+(_speed) == SPEED_100 + ALX_FULL_DUPLEX ? ADVERTISED_100baseT_Full :	\
+(_speed) == SPEED_100 + ALX_HALF_DUPLEX ? ADVERTISED_10baseT_Half :		\
+(_speed) == SPEED_10 + ALX_FULL_DUPLEX ? ADVERTISED_10baseT_Full :		\
+(_speed) == SPEED_10 + ALX_HALF_DUPLEX ? ADVERTISED_10baseT_Half :		\
 0)
 
 #define speed_desc(_s) (\
-	(_s) == SPEED_1000 + FULL_DUPLEX ? \
+	(_s) == SPEED_1000 + ALX_FULL_DUPLEX ? \
 	"1 Gbps Full" : \
-	(_s) == SPEED_100 + FULL_DUPLEX ? \
+	(_s) == SPEED_100 + ALX_FULL_DUPLEX ? \
 	"100 Mbps Full" : \
-	(_s) == SPEED_100 + HALF_DUPLEX ? \
+	(_s) == SPEED_100 + ALX_HALF_DUPLEX ? \
 	"100 Mbps Half" : \
-	(_s) == SPEED_10 + FULL_DUPLEX ? \
+	(_s) == SPEED_10 + ALX_FULL_DUPLEX ? \
 	"10 Mbps Full" : \
-	(_s) == SPEED_10 + HALF_DUPLEX ? \
+	(_s) == SPEED_10 + ALX_HALF_DUPLEX ? \
 	"10 Mbps Half" : \
 	"Unknown speed")
 

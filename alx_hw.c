@@ -523,7 +523,7 @@ void alx_start_mac(struct alx_hw *hw)
 	ALX_MEM_W32(hw, ALX_TXQ0, txq | ALX_TXQ0_EN);
 
 	mac = hw->rx_ctrl;
-	if (hw->link_duplex == FULL_DUPLEX)
+	if (hw->link_duplex == ALX_FULL_DUPLEX)
 		mac |= ALX_MAC_CTRL_FULLD;
 	else
 		mac &= ~ALX_MAC_CTRL_FULLD;
@@ -815,7 +815,7 @@ int alx_pre_suspend(struct alx_hw *hw, u16 speed)
 		mac |= ALX_MAC_CTRL_RX_EN | ALX_MAC_CTRL_BRD_EN;
 	if (hw->sleep_ctrl & ALX_SLEEP_CIFS)
 		mac |= ALX_MAC_CTRL_TX_EN;
-	if (speed % 10 == FULL_DUPLEX)
+	if (speed % 10 == ALX_FULL_DUPLEX)
 		mac |= ALX_MAC_CTRL_FULLD;
 	if (speed >= SPEED_1000)
 		FIELD_SET32(mac, ALX_MAC_CTRL_SPEED, ALX_MAC_CTRL_SPEED_1000);
@@ -1172,7 +1172,7 @@ int alx_get_phy_link(struct alx_hw *hw, bool *link_up, u16 *speed)
 	default:
 		goto wrong_spd_out;
 	}
-	*speed += (giga & ALX_GIGA_PSSR_DPLX) ? FULL_DUPLEX : HALF_DUPLEX;
+	*speed += (giga & ALX_GIGA_PSSR_DPLX) ? ALX_FULL_DUPLEX : ALX_HALF_DUPLEX;
 	goto out;
 
 wrong_spd_out:
@@ -1396,13 +1396,13 @@ int alx_select_powersaving_speed(struct alx_hw *hw, u16 *speed)
 		goto out;
 	}
 	if (lpa & LPA_10FULL)
-		*speed = SPEED_10 + FULL_DUPLEX;
+		*speed = SPEED_10 + ALX_FULL_DUPLEX;
 	else if (lpa & LPA_10HALF)
-		*speed = SPEED_10 + HALF_DUPLEX;
+		*speed = SPEED_10 + ALX_HALF_DUPLEX;
 	else if (lpa & LPA_100FULL)
-		*speed = SPEED_100 + FULL_DUPLEX;
+		*speed = SPEED_100 + ALX_FULL_DUPLEX;
 	else
-		*speed = SPEED_100 + HALF_DUPLEX;
+		*speed = SPEED_100 + ALX_HALF_DUPLEX;
 
 	if (*speed != spd) {
 		err = alx_write_phy_reg(hw, ALX_MII_IER, 0);
