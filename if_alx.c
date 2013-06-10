@@ -76,6 +76,7 @@ static int	alx_attach(device_t);
 static int	alx_detach(device_t);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
+static void	alx_int_task(void *, int);
 static int	alx_irq_legacy(void *);
 static int	alx_media_change(struct ifnet *);
 static void	alx_media_status(struct ifnet *, struct ifmediareq *);
@@ -2624,6 +2625,11 @@ static const struct net_device_ops alx_netdev_ops = {
 
 #endif
 
+static void
+alx_int_task(void *context __unused, int pending __unused)
+{
+}
+
 static int
 alx_irq_legacy(void *arg)
 {
@@ -2670,6 +2676,7 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 		device_printf(dev, "could not create taskqueue\n");
 		return (ENXIO);
 	}
+	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
 	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
 	    device_get_nameunit(sc->alx_dev));
 
@@ -2950,7 +2957,13 @@ alx_detach(device_t dev)
 		sc->alx_ifp = NULL;
 	}
 
-	/* XXX tear down interrupt handlers. */
+	if (sc->alx_tq != NULL) {
+		taskqueue_drain(sc->alx_tq, &sc->alx_int_task);
+		taskqueue_free(sc->alx_tq);
+	}
+
+	if (sc->alx_cookie != NULL)
+		bus_teardown_intr(dev, sc->alx_irq, sc->alx_cookie);
 
 	if (sc->alx_irq != NULL)
 		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->alx_irq);

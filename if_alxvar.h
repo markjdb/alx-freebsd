@@ -202,6 +202,7 @@ struct alx_softc {
         struct ifnet		*alx_ifp;
 
 	struct taskqueue	*alx_tq;
+	struct task		 alx_int_task;
 
 	bus_dma_tag_t		 alx_parent_tag;
 
