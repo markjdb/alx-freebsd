@@ -22,7 +22,9 @@
 #include <sys/bitstring.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/queue.h>
 #include <sys/rman.h>
 #include <sys/socket.h>
@@ -74,6 +76,7 @@ static struct alx_dev {
 static int	alx_allocate_legacy_irq(struct alx_softc *);
 static int	alx_attach(device_t);
 static int	alx_detach(device_t);
+static int	alx_dma_alloc(struct alx_softc *);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_int_task(void *, int);
@@ -81,6 +84,7 @@ static int	alx_irq_legacy(void *);
 static int	alx_media_change(struct ifnet *);
 static void	alx_media_status(struct ifnet *, struct ifmediareq *);
 static int	alx_probe(device_t);
+static void	alx_start(struct ifnet *);
 
 static device_method_t alx_methods[] = {
 	DEVMETHOD(device_probe,		alx_probe),
@@ -273,11 +277,12 @@ alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 static int
 alx_dma_alloc(struct alx_softc *sc)
 {
-	int rxringsz;
+	struct alx_hw *hw;
 	device_t dev;
-	int error;
+	int error, rxringsz;
 
 	dev = sc->alx_dev;
+	hw = &sc->hw;
 
 	/* XXX I don't think the parent tag is very useful... nuke it? */
 	error = bus_dma_tag_create(
@@ -337,6 +342,8 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
+	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
+
 	rxringsz = sc->rx_ringsz *
 	    (sizeof(struct rfd_desc) + sizeof(struct rrd_desc));
 
@@ -378,6 +385,10 @@ alx_dma_alloc(struct alx_softc *sc)
 		/* XXX cleanup */
 		return (error);
 	}
+
+	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
 
 	return (error);
 }
@@ -2626,6 +2637,16 @@ static const struct net_device_ops alx_netdev_ops = {
 #endif
 
 static void
+alx_start(struct ifnet *ifp)
+{
+	struct alx_softc *sc;
+
+	sc = ifp->if_softc;
+	ALX_LOCK(sc);
+	ALX_UNLOCK(sc);
+}
+
+static void
 alx_int_task(void *context __unused, int pending __unused)
 {
 }
@@ -2806,6 +2827,9 @@ alx_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->alx_dev = dev;
 
+	mtx_init(&sc->alx_mtx, device_get_nameunit(dev), MTX_NETWORK_LOCK,
+	    MTX_DEF);
+
 	pci_enable_busmaster(dev);
 
 	rid = PCIR_BAR(0);
@@ -2881,8 +2905,8 @@ alx_attach(device_t dev)
 	if_initname(ifp, device_get_name(dev), device_get_unit(dev));
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST; /* XXX */
 	ifp->if_ioctl = alx_ioctl;
-#ifdef notyet
 	ifp->if_start = alx_start;
+#ifdef notyet
 	ifp->if_init = alx_init;
 #endif
 	ifp->if_capabilities = IFCAP_HWCSUM; /* XXX others? */
@@ -2971,6 +2995,8 @@ alx_detach(device_t dev)
 	if (sc->alx_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, PCIR_BAR(0),
 		    sc->alx_res);
+
+	mtx_destroy(&sc->alx_mtx);
 
 	return (0);
 }

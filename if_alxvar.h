@@ -149,9 +149,6 @@ struct alx_hw;
  *board specific private data structure
  */
 struct alx_softc {
-	struct net_device	*netdev;
-	struct pci_dev		*pdev;
-
 	struct alx_hw		hw;
 
 	u16		bd_number;
@@ -166,7 +163,9 @@ struct alx_softc {
 	int			rx_ringsz;
 	int			rxbuf_size;
 
+#ifdef notyet
 	struct alx_napi		*qnapi[8];
+#endif
 	/* number of napi for TX-Q */
 	int			nr_txq;
 	/* number of napi for RX-Q */
@@ -215,8 +214,15 @@ struct alx_softc {
 	bus_dmamap_t		 alx_rx_dmamap;
 	caddr_t			 alx_rx_vaddr;
 	bus_addr_t		 alx_rx_paddr;
+
+	struct alx_tx_queue	*alx_tx_queue;
+	struct alx_rx_queue	*alx_rx_queue;
+
+	struct mtx		 alx_mtx;
 };
 
+#define ALX_LOCK(sc)	mtx_lock(&(sc)->alx_mtx)
+#define ALX_UNLOCK(sc)	mtx_unlock(&(sc)->alx_mtx)
 
 #define ALX_FLAG(_adpt, _FLAG) (\
 	test_bit(ALX_FLAG_##_FLAG, &(_adpt)->flags))
