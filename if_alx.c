@@ -79,12 +79,15 @@ static int	alx_detach(device_t);
 static int	alx_dma_alloc(struct alx_softc *);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
+static void	alx_init(void *);
+static void	alx_init_locked(struct alx_softc *);
 static void	alx_int_task(void *, int);
 static int	alx_irq_legacy(void *);
 static int	alx_media_change(struct ifnet *);
 static void	alx_media_status(struct ifnet *, struct ifmediareq *);
 static int	alx_probe(device_t);
 static void	alx_start(struct ifnet *);
+static void	alx_start_locked(struct ifnet *);
 
 static device_method_t alx_methods[] = {
 	DEVMETHOD(device_probe,		alx_probe),
@@ -1241,7 +1244,7 @@ alx_init_sw(struct alx_softc *sc)
 
 	err = alx_identify_hw(sc);
 	if (err) {
-		device_printf(dev, "unrecognize the chip, aborting\n");
+		device_printf(dev, "unrecognized chip, aborting\n");
 		return (err);
 	}
 
@@ -1264,25 +1267,18 @@ alx_init_sw(struct alx_softc *sc)
 	hw->link_up = false;
 	hw->link_duplex = 0;
 	hw->link_speed = SPEED_0;
-	hw->adv_cfg =	ADVERTISED_Autoneg |
-			ADVERTISED_10baseT_Half |
-			ADVERTISED_10baseT_Full |
-			ADVERTISED_100baseT_Full |
-			ADVERTISED_100baseT_Half |
-			ADVERTISED_1000baseT_Full;
+	hw->adv_cfg = ADVERTISED_Autoneg | ADVERTISED_10baseT_Half |
+	    ADVERTISED_10baseT_Full | ADVERTISED_100baseT_Full |
+	    ADVERTISED_100baseT_Half | ADVERTISED_1000baseT_Full;
 	hw->flowctrl = ALX_FC_ANEG | ALX_FC_RX | ALX_FC_TX;
 	hw->wrr_ctrl = ALX_WRR_PRI_RESTRICT_NONE;
 	for (i = 0; i < ARRAY_SIZE(hw->wrr); i++)
 		hw->wrr[i] = 4;
 
-	hw->rx_ctrl = ALX_MAC_CTRL_WOLSPED_SWEN |
-			ALX_MAC_CTRL_MHASH_ALG_HI5B |
-			ALX_MAC_CTRL_BRD_EN |
-			ALX_MAC_CTRL_PCRCE |
-			ALX_MAC_CTRL_CRCE |
-			ALX_MAC_CTRL_RXFC_EN |
-			ALX_MAC_CTRL_TXFC_EN |
-			FIELDX(ALX_MAC_CTRL_PRMBLEN, 7);
+	hw->rx_ctrl = ALX_MAC_CTRL_WOLSPED_SWEN | ALX_MAC_CTRL_MHASH_ALG_HI5B |
+	    ALX_MAC_CTRL_BRD_EN | ALX_MAC_CTRL_PCRCE | ALX_MAC_CTRL_CRCE |
+	    ALX_MAC_CTRL_RXFC_EN | ALX_MAC_CTRL_TXFC_EN |
+	    FIELDX(ALX_MAC_CTRL_PRMBLEN, 7);
 	hw->is_fpga = false;
 
 	//atomic_set(&adpt->irq_sem, 1);
@@ -2637,13 +2633,35 @@ static const struct net_device_ops alx_netdev_ops = {
 #endif
 
 static void
+alx_init(void *arg)
+{
+	struct alx_softc *sc;
+
+	sc = arg;
+	ALX_LOCK(sc);
+	alx_init_locked(sc);
+	ALX_UNLOCK(sc);
+}
+
+static void
+alx_init_locked(struct alx_softc *sc)
+{
+}
+
+static void
 alx_start(struct ifnet *ifp)
 {
 	struct alx_softc *sc;
 
 	sc = ifp->if_softc;
 	ALX_LOCK(sc);
+	alx_start_locked(ifp);
 	ALX_UNLOCK(sc);
+}
+
+static void
+alx_start_locked(struct ifnet *ifp)
+{
 }
 
 static void
@@ -2904,12 +2922,10 @@ alx_attach(device_t dev)
 	ifp->if_softc = sc;
 	if_initname(ifp, device_get_name(dev), device_get_unit(dev));
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST; /* XXX */
+	ifp->if_capabilities = IFCAP_HWCSUM; /* XXX others? */
 	ifp->if_ioctl = alx_ioctl;
 	ifp->if_start = alx_start;
-#ifdef notyet
 	ifp->if_init = alx_init;
-#endif
-	ifp->if_capabilities = IFCAP_HWCSUM; /* XXX others? */
 
 	ether_ifattach(ifp, hw->mac_addr);
 

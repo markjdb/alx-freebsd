@@ -215,8 +215,8 @@ struct alx_softc {
 	caddr_t			 alx_rx_vaddr;
 	bus_addr_t		 alx_rx_paddr;
 
-	struct alx_tx_queue	*alx_tx_queue;
-	struct alx_rx_queue	*alx_rx_queue;
+	struct alx_tx_queue	 alx_tx_queue;
+	struct alx_rx_queue	 alx_rx_queue;
 
 	struct mtx		 alx_mtx;
 };
