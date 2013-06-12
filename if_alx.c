@@ -2975,8 +2975,7 @@ alx_attach(device_t dev)
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_10_T | IFM_FDX, 0, NULL);
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX, 0, NULL);
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
-	if (pci_get_device(dev) == ALX_DEV_ID_AR8161) {
-		/* XXX */
+	if (pci_get_device(dev) & 1) {
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T, 0, NULL);
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0,
 		    NULL);
