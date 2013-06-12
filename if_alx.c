@@ -33,6 +33,7 @@
 
 #include <net/ethernet.h>
 #include <net/if.h>
+#include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/if_types.h>
 #include <net/if_vlan_var.h>
@@ -82,17 +83,26 @@ static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
 static void	alx_int_task(void *, int);
+static void	alx_irq_disable(struct alx_softc *);
 static int	alx_irq_legacy(void *);
 static int	alx_media_change(struct ifnet *);
 static void	alx_media_status(struct ifnet *, struct ifmediareq *);
 static int	alx_probe(device_t);
+static void	alx_reset(struct alx_softc *sc);
+static int	alx_resume(device_t);
+static int	alx_shutdown(device_t);
 static void	alx_start(struct ifnet *);
 static void	alx_start_locked(struct ifnet *);
+static void	alx_stop(struct alx_softc *);
+static int	alx_suspend(device_t);
 
 static device_method_t alx_methods[] = {
 	DEVMETHOD(device_probe,		alx_probe),
 	DEVMETHOD(device_attach,	alx_attach),
 	DEVMETHOD(device_detach,	alx_detach),
+	DEVMETHOD(device_shutdown,	alx_shutdown),
+	DEVMETHOD(device_suspend,	alx_suspend),
+	DEVMETHOD(device_resume,	alx_resume),
 
 	DEVMETHOD_END
 };
@@ -1048,27 +1058,26 @@ static void alx_irq_enable(struct alx_adapter *adpt)
 		alx_mask_msix(hw, i, false);
 }
 
-static void alx_irq_disable(struct alx_adapter *adpt)
+#endif
+
+static void
+alx_irq_disable(struct alx_softc *sc)
 {
-	struct alx_hw *hw = &adpt->hw;
+	struct alx_hw *hw = &sc->hw;
 	int i;
 
-	atomic_inc(&adpt->irq_sem);
+	//atomic_inc(&adpt->irq_sem);
 
 	ALX_MEM_W32(hw, ALX_ISR, ALX_ISR_DIS);
 	ALX_MEM_W32(hw, ALX_IMR, 0);
 	ALX_MEM_FLUSH(hw);
 
-	if (ALX_FLAG(adpt, USING_MSIX)) {
-		for (i = 0; i < adpt->nr_vec; i++) {
+	if (ALX_FLAG(sc, USING_MSIX))
+		for (i = 0; i < sc->nr_vec; i++)
 			alx_mask_msix(hw, i, true);
-			synchronize_irq(adpt->msix_ent[i].vector);
-		}
-	} else {
-		synchronize_irq(adpt->pdev->irq);
-	}
 }
 
+#if 0
 static int alx_request_irq(struct alx_adapter *adpt)
 {
 	struct pci_dev *pdev = adpt->pdev;
@@ -1556,15 +1565,6 @@ static void alx_activate(struct alx_adapter *adpt)
 
 	ALX_FLAG_SET(adpt, TASK_CHK_LINK);
 	alx_schedule_work(adpt);
-}
-
-static void __alx_stop(struct alx_adapter *adpt)
-{
-	alx_halt(adpt, false);
-
-	alx_free_irq(adpt);
-
-	alx_free_all_ring_resources(adpt);
 }
 
 static void alx_init_ring_ptrs(struct alx_adapter *adpt)
@@ -2612,24 +2612,6 @@ static void alx_poll_controller(struct net_device *netdev)
 }
 #endif
 
-static const struct net_device_ops alx_netdev_ops = {
-	.ndo_open               = alx_open,
-	.ndo_stop               = alx_stop,
-	.ndo_start_xmit         = alx_start_xmit,
-	.ndo_get_stats          = alx_get_stats,
-	.ndo_set_rx_mode        = alx_set_rx_mode,
-	.ndo_validate_addr      = eth_validate_addr,
-	.ndo_set_mac_address    = alx_set_mac_address,
-	.ndo_change_mtu         = alx_change_mtu,
-	.ndo_do_ioctl           = alx_ioctl,
-	.ndo_tx_timeout         = alx_tx_timeout,
-	.ndo_fix_features	= alx_fix_features,
-	.ndo_set_features	= alx_set_features,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller    = alx_poll_controller,
-#endif
-};
-
 #endif
 
 static void
@@ -2646,6 +2628,24 @@ alx_init(void *arg)
 static void
 alx_init_locked(struct alx_softc *sc)
 {
+	struct ifnet *ifp;
+	struct alx_hw *hw;
+
+	ALX_LOCK_ASSERT(sc);
+
+	ifp = sc->alx_ifp;
+	hw = &sc->hw;
+
+	alx_stop(sc);
+
+	/* Reset to a known good state. */
+	alx_reset(sc);
+
+	memcpy(hw->mac_addr, IF_LLADDR(ifp), ETHER_ADDR_LEN);
+	alx_set_macaddr(hw, hw->mac_addr);
+
+	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
 }
 
 static void
@@ -2662,6 +2662,45 @@ alx_start(struct ifnet *ifp)
 static void
 alx_start_locked(struct ifnet *ifp)
 {
+
+	ALX_LOCK_ASSERT(sc);
+}
+
+static void
+alx_stop(struct alx_softc *sc)
+{
+	struct ifnet *ifp;
+
+	ALX_LOCK_ASSERT(sc);
+
+	ifp = sc->alx_ifp;
+	ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
+
+	alx_irq_disable(sc);
+
+	/* XXX what else? */
+}
+
+static void
+alx_reset(struct alx_softc *sc)
+{
+	device_t dev;
+	struct alx_hw *hw;
+	bool phy_cfged;
+
+	dev = sc->alx_dev;
+	hw = &sc->hw;
+
+	alx_reset_pcie(hw);
+
+	phy_cfged = alx_phy_configed(hw);
+	if (!phy_cfged)
+		alx_reset_phy(hw, !hw->hib_patch);
+
+	if (alx_reset_mac(hw))
+		device_printf(dev, "failed to reset MAC\n");
+
+	/* XXX what else? */
 }
 
 static void
@@ -3013,6 +3052,27 @@ alx_detach(device_t dev)
 		    sc->alx_res);
 
 	mtx_destroy(&sc->alx_mtx);
+
+	return (0);
+}
+
+static int
+alx_shutdown(device_t dev)
+{
+
+	return (0);
+}
+
+static int
+alx_suspend(device_t dev)
+{
+
+	return (0);
+}
+
+static int
+alx_resume(device_t dev)
+{
 
 	return (0);
 }

@@ -221,8 +221,9 @@ struct alx_softc {
 	struct mtx		 alx_mtx;
 };
 
-#define ALX_LOCK(sc)	mtx_lock(&(sc)->alx_mtx)
-#define ALX_UNLOCK(sc)	mtx_unlock(&(sc)->alx_mtx)
+#define ALX_LOCK(sc)		mtx_lock(&(sc)->alx_mtx)
+#define ALX_UNLOCK(sc)		mtx_unlock(&(sc)->alx_mtx)
+#define ALX_LOCK_ASSERT(sc)	mtx_assert(&(sc)->alx_mtx, MA_OWNED)
 
 #define ALX_FLAG(_adpt, _FLAG) (\
 	test_bit(ALX_FLAG_##_FLAG, &(_adpt)->flags))
