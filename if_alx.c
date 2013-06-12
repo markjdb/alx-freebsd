@@ -68,8 +68,10 @@ static struct alx_dev {
 	    "Qualcomm Atheros AR8161 Gigabit Ethernet" },
 	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8162,
 	    "Qualcomm Atheros AR8162 Fast Ethernet" },
-	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8171, "" },
-	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8172, "" },
+	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8171,
+	    "Qualcomm Atheros AR8171 Gigabit Ethernet" },
+	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8172,
+	    "Qualcomm Atheros AR8172 Fast Ethernet" },
 };
 
 #define ALX_DEV_COUNT	(sizeof(alx_devs) / sizeof(alx_devs[0]))
