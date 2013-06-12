@@ -19,10 +19,6 @@
 
 #define ALX_WATCHDOG_TIME   (5 * HZ)
 
-#define ALX_TSO_MAX_SIZE	(65535 + sizeof(struct ether_vlan_header))
-#define ALX_MAX_TX_SEGS		1       /* XXX */
-#define ALX_MAX_SEGSIZE		0       /* XXX */
-
 /*
  * alx_ring_header is a single, contiguous block of memory space
  * used by the three descriptor rings (tpd, rfd, rrd)
@@ -91,11 +87,9 @@ struct alx_rx_queue {
 
 /* tx queue */
 struct alx_tx_queue {
-	struct net_device *netdev;
-	/* device pointer for dma operation */
-	struct device *dev;
 	/* tpd ring virtual addr */
 	struct tpd_desc *tpd_hdr;
+	/* tpd ring physical address. */
 	dma_addr_t tpd_dma;
 	/* info for tx-skbs pending on HW */
 	struct alx_buffer *bf_info;
@@ -207,13 +201,12 @@ struct alx_softc {
 
 	bus_dma_tag_t		 alx_tx_tag;
 	bus_dmamap_t		 alx_tx_dmamap;
-	caddr_t			 alx_tx_vaddr;
-	bus_addr_t		 alx_tx_paddr;
 
 	bus_dma_tag_t		 alx_rx_tag;
 	bus_dmamap_t		 alx_rx_dmamap;
-	caddr_t			 alx_rx_vaddr;
-	bus_addr_t		 alx_rx_paddr;
+
+	bus_dma_tag_t		 alx_rr_tag;
+	bus_dmamap_t		 alx_rr_dmamap;
 
 	struct alx_tx_queue	 alx_tx_queue;
 	struct alx_rx_queue	 alx_rx_queue;

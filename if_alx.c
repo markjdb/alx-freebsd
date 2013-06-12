@@ -82,6 +82,7 @@ static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
+static void	alx_init_tx_ring(struct alx_softc *);
 static void	alx_int_task(void *, int);
 static void	alx_irq_disable(struct alx_softc *);
 static int	alx_irq_legacy(void *);
@@ -287,17 +288,21 @@ alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 	*(bus_addr_t *)arg = segs[0].ds_addr;
 }
 
+/*
+ * XXX:
+ * - multiple queues
+ * - does the chipset's DMA engine support more than one segment?
+ */
 static int
 alx_dma_alloc(struct alx_softc *sc)
 {
-	struct alx_hw *hw;
 	device_t dev;
-	int error, rxringsz;
+	struct alx_hw *hw;
+	int error;
 
 	dev = sc->alx_dev;
 	hw = &sc->hw;
 
-	/* XXX I don't think the parent tag is very useful... nuke it? */
 	error = bus_dma_tag_create(
 	    bus_get_dma_tag(sc->alx_dev),	/* parent */
 	    1, 0,				/* alignment, boundary */
@@ -319,7 +324,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
 	    bus_get_dma_tag(dev),		/* parent */
-	    256, 0,				/* alignment, boundary */
+	    8, 0,				/* alignment, boundary */
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
@@ -335,7 +340,8 @@ alx_dma_alloc(struct alx_softc *sc)
 	}
 
 	/* Allocate DMA memory for the transmit packet descriptor ring. */
-	error = bus_dmamem_alloc(sc->alx_tx_tag, (void **)&sc->alx_tx_vaddr,
+	error = bus_dmamem_alloc(sc->alx_tx_tag,
+	    (void **)&sc->alx_tx_queue.tpd_hdr,
 	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT,
 	    &sc->alx_tx_dmamap);
 	if (error != 0) {
@@ -347,30 +353,65 @@ alx_dma_alloc(struct alx_softc *sc)
 
 	/* Do the actual DMA mapping of the transmit packet descriptor ring. */
 	error = bus_dmamap_load(sc->alx_tx_tag, sc->alx_tx_dmamap,
-	    sc->alx_tx_vaddr, sc->tx_ringsz * sizeof(struct tpd_desc),
-	    alx_dmamap_cb, &sc->alx_tx_paddr, 0);
+	    sc->alx_tx_queue.tpd_hdr, sc->tx_ringsz * sizeof(struct tpd_desc),
+	    alx_dmamap_cb, &sc->alx_tx_queue.tpd_dma, 0);
 	if (error != 0) {
 		device_printf(dev, "could not load DMA map for TX ring\n");
 		/* XXX cleanup */
 		return (error);
 	}
 
-	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
-
-	rxringsz = sc->rx_ringsz *
-	    (sizeof(struct rfd_desc) + sizeof(struct rrd_desc));
-
-	/* Create the DMA tag for the receive free descriptor ring. */
+	/* Create the DMA tag for the receive ready descriptor ring. */
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
 	    bus_get_dma_tag(dev),		/* parent */
-	    256, 0,				/* alignment, boundary */
+	    8, 0,				/* alignment, boundary */
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
-	    rxringsz,				/* maxsize */
+	    sc->rx_ringsz * sizeof(struct rrd_desc), /* maxsize */
 	    1,					/* nsegments */
-	    rxringsz,				/* maxsegsize */
+	    sc->rx_ringsz * sizeof(struct rrd_desc), /* maxsegsize */
+	    0,					/* flags */
+	    NULL, NULL,				/* lockfunc, lockfuncarg */
+	    &sc->alx_rr_tag);
+	if (error != 0) {
+		device_printf(dev, "could not create RX descriptor ring tag\n");
+		return (error);
+	}
+
+	error = bus_dmamem_alloc(sc->alx_rr_tag,
+	    (void **)&sc->alx_rx_queue.rrd_hdr,
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT,
+	    &sc->alx_rr_dmamap);
+	if (error != 0) {
+		device_printf(dev,
+		    "could not allocate DMA'able memory for RX ring\n");
+		/* XXX cleanup */
+		return (error);
+	}
+
+	error = bus_dmamap_load(sc->alx_rr_tag, sc->alx_rr_dmamap,
+	    sc->alx_rx_queue.rrd_hdr, sc->rx_ringsz * sizeof(struct rrd_desc),
+	    alx_dmamap_cb, &sc->alx_rx_queue.rrd_dma, 0);
+	if (error != 0) {
+		device_printf(dev,
+		    "could not load DMA map for RX ready ring\n");
+		/* XXX cleanup */
+		return (error);
+	}
+
+	/* Create the DMA tag for the receive ready descriptor ring. */
+	/* XXX assuming 1 queue at the moment. */
+	error = bus_dma_tag_create(
+	    bus_get_dma_tag(dev),		/* parent */
+	    8, 0,				/* alignment, boundary */
+	    BUS_SPACE_MAXADDR,			/* lowaddr */
+	    BUS_SPACE_MAXADDR,			/* highaddr */
+	    NULL, NULL,				/* filter, filterarg */
+	    sc->rx_ringsz * sizeof(struct rfd_desc), /* maxsize */
+	    1,					/* nsegments */
+	    sc->rx_ringsz * sizeof(struct rfd_desc), /* maxsegsize */
 	    0,					/* flags */
 	    NULL, NULL,				/* lockfunc, lockfuncarg */
 	    &sc->alx_rx_tag);
@@ -379,8 +420,8 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
-	/* Allocate DMA memory for the receive packet descriptor ring. */
-	error = bus_dmamem_alloc(sc->alx_rx_tag, (void **)&sc->alx_rx_vaddr,
+	error = bus_dmamem_alloc(sc->alx_rx_tag,
+	    (void **)&sc->alx_rx_queue.rfd_hdr,
 	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT,
 	    &sc->alx_rx_dmamap);
 	if (error != 0) {
@@ -390,18 +431,14 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
-	/* Do the actual DMA mapping of the transmit packet descriptor ring. */
 	error = bus_dmamap_load(sc->alx_rx_tag, sc->alx_rx_dmamap,
-	    sc->alx_rx_vaddr, rxringsz, alx_dmamap_cb, &sc->alx_rx_paddr, 0);
+	    sc->alx_rx_queue.rfd_hdr, sc->rx_ringsz * sizeof(struct rfd_desc),
+	    alx_dmamap_cb, &sc->alx_rx_queue.rfd_dma, 0);
 	if (error != 0) {
-		device_printf(dev, "could not load DMA map for RX ring\n");
+		device_printf(dev, "could not load DMA map for RX free ring\n");
 		/* XXX cleanup */
 		return (error);
 	}
-
-	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
 
 	return (error);
 }
@@ -2615,6 +2652,25 @@ static void alx_poll_controller(struct net_device *netdev)
 #endif
 
 static void
+alx_init_tx_ring(struct alx_softc *sc)
+{
+	struct alx_hw *hw;
+
+	ALX_LOCK_ASSERT(sc);
+
+	hw = &sc->hw;
+
+	sc->alx_tx_queue.pidx = 0;
+	sc->alx_tx_queue.cidx = 0;
+	sc->alx_tx_queue.count = 0;
+
+	/* XXX multiple queues */
+	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
+	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma);
+	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
+}
+
+static void
 alx_init(void *arg)
 {
 	struct alx_softc *sc;
@@ -2646,6 +2702,12 @@ alx_init_locked(struct alx_softc *sc)
 
 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
 	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+
+	alx_init_tx_ring(sc);
+	// alx_init_rx_ring(sc);
+
+	/* Load the DMA pointers. */
+	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
 }
 
 static void
@@ -2976,6 +3038,7 @@ alx_attach(device_t dev)
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX, 0, NULL);
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
 	if (pci_get_device(dev) & 1) {
+		/* GigE-capable chipsets have an odd device ID. */
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T, 0, NULL);
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0,
 		    NULL);

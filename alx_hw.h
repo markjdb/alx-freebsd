@@ -581,14 +581,14 @@ enum ALX_CAPS {
 	(*(u8 *)(pdat) = bus_read_1((s)->hw_addr, reg))
 
 /* write to 16bit register via pci memory space */
-#define ALX_MEM_W16(s, reg, val) (bus_write_2((s)->hw_addr, (reg), (val)))
+#define ALX_MEM_W16(s, reg, val)	bus_write_2((s)->hw_addr, (reg), (val))
 
 /* read from 16bit register via pci memory space */
 #define ALX_MEM_R16(s, reg, pdat)	\
 	(*(u16 *)(pdat) = bus_read_2((s)->hw_addr, reg))
 
 /* write to 32bit register via pci memory space */
-#define ALX_MEM_W32(s, reg, val) (bus_write_4((s)->hw_addr, (reg), (val)))
+#define ALX_MEM_W32(s, reg, val)	bus_write_4((s)->hw_addr, (reg), (val))
 
 /* read from 32bit register via pci memory space */
 #define ALX_MEM_R32(s, reg, pdat)	\
@@ -602,9 +602,8 @@ enum ALX_CAPS {
 #define ALX_CFG_W16(s, reg, val)	\
 	(pci_write_config((s)->dev, (reg), (val), 2))
 
-/* flush regs */
-#define ALX_MEM_FLUSH(s) (readl((s)->hw_addr))
-
+/* Flush registers. */
+#define ALX_MEM_FLUSH(s)	bus_read_4((s)->hw_addr, 0)
 
 int alx_get_perm_macaddr(struct alx_hw *hw, u8 *addr);
 void alx_add_mc_addr(struct alx_hw *hw, u8 *addr);
