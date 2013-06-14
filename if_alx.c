@@ -21,8 +21,10 @@
 #include <sys/systm.h>
 #include <sys/bitstring.h>
 #include <sys/bus.h>
+#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
+#include <sys/mbuf.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/queue.h>
@@ -31,11 +33,13 @@
 #include <sys/sockio.h>
 #include <sys/taskqueue.h>
 
+#include <net/bpf.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/if_types.h>
+#include <net/if_var.h>
 #include <net/if_vlan_var.h>
 
 #include <netinet/in.h>
@@ -82,6 +86,7 @@ static int	alx_detach(device_t);
 static int	alx_dma_alloc(struct alx_softc *);
 static void	alx_dma_free(struct alx_softc *);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
+static int	alx_encap(struct alx_softc *, struct mbuf **);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
@@ -2617,12 +2622,69 @@ alx_init_locked(struct alx_softc *sc)
 	alx_intr_enable(sc);
 }
 
+static int
+alx_encap(struct alx_softc *sc, struct mbuf **m_head)
+{
+	struct mbuf *m;
+	struct tpd_desc *td;
+	bus_dma_segment_t seg;
+	int first, error, nsegs, i;
+
+	ALX_LOCK_ASSERT(sc);
+
+	M_ASSERTPKTHDR(*m_head);
+
+	/* XXX figure out how segments the DMA engine can support. */
+retry:
+	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_tag, sc->alx_tx_dmamap,
+	    *m_head, &seg, &nsegs, 0);
+	if (error == EFBIG) {
+		m = m_collapse(*m_head, M_NOWAIT, 1);
+		if (m == NULL) {
+			/* XXX increment counter? */
+			m_freem(*m_head);
+			*m_head = NULL;
+			return (ENOBUFS);
+		}
+		*m_head = m;
+		/* XXX how do we guarantee this won't loop forever? */
+		goto retry;
+	} else
+		/* XXX increment counter? */
+		return (error);
+
+	if (nsegs == 0) {
+		m_freem(*m_head);
+		*m_head = NULL;
+		return (EIO);
+	}
+
+	/* Make sure we have enough descriptors available. */
+	/* XXX what's up with the - 2? It's in em(4) and age(4). */
+	if (nsegs > sc->alx_tx_queue.count - 2) {
+		/* XXX increment counter? */
+		bus_dmamap_unload(sc->alx_tx_tag, sc->alx_tx_dmamap);
+		return (ENOBUFS);
+	}
+
+	for (i = 0; i < nsegs; i++) {
+		first = sc->alx_tx_queue.pidx;
+		td = &sc->alx_tx_queue.tpd_hdr[first];
+		td->addr = htole64(seg.ds_addr);
+		FIELD_SET32(td->word0, TPD_BUFLEN, seg.ds_len);
+	}
+
+	return (0);
+}
+
 static void
 alx_start(struct ifnet *ifp)
 {
-	struct alx_softc *sc;
+	struct alx_softc *sc = ifp->if_softc;
 
-	sc = ifp->if_softc;
+	if (!(ifp->if_drv_flags & IFF_DRV_RUNNING))
+		return;
+
 	ALX_LOCK(sc);
 	alx_start_locked(ifp);
 	ALX_UNLOCK(sc);
@@ -2631,10 +2693,34 @@ alx_start(struct ifnet *ifp)
 static void
 alx_start_locked(struct ifnet *ifp)
 {
+	struct alx_softc *sc;
+	struct mbuf *m_head;
 
+	sc = ifp->if_softc;
 	ALX_LOCK_ASSERT(sc);
 
-	printf("in alx_start_locked()\n");
+	if ((ifp->if_drv_flags & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING)
+		return;
+
+	/* XXX check link here. */
+
+	while (!IFQ_DRV_IS_EMPTY(&ifp->if_snd)) {
+		IFQ_DRV_DEQUEUE(&ifp->if_snd, m_head);
+		if (m_head == NULL)
+			break;
+
+		if (alx_encap(sc, &m_head)) {
+			if (m_head != NULL)
+				IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
+			break;
+		}
+
+		/* Let BPF listeners know about this frame. */
+		ETHER_BPF_MTAP(ifp, m_head);
+	}
+
+	/* XXX start wdog */
 }
 
 static void

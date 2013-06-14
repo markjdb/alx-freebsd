@@ -110,18 +110,6 @@ struct alx_tx_queue {
 #define ALX_TX_WAKEUP_THRESH(_tq) ((_tq)->count / 4)
 #define ALX_DEFAULT_TX_WORK		128
 
-struct alx_napi {
-#ifdef notyet
-	struct napi_struct	napi;
-#endif
-	struct alx_softc	*adpt;
-	struct alx_rx_queue	*rxq;
-	struct alx_tx_queue	*txq;
-	int			vec_idx;
-	u32			vec_mask;
-	char			irq_lbl[IFNAMSIZ];
-};
-
 enum ALX_FLAGS {
 	ALX_FLAG_USING_MSIX = 0,
 	ALX_FLAG_USING_MSI,
