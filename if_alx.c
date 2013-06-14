@@ -80,13 +80,15 @@ static int	alx_allocate_legacy_irq(struct alx_softc *);
 static int	alx_attach(device_t);
 static int	alx_detach(device_t);
 static int	alx_dma_alloc(struct alx_softc *);
+static void	alx_dma_free(struct alx_softc *);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
 static void	alx_init_tx_ring(struct alx_softc *);
 static void	alx_int_task(void *, int);
-static void	alx_irq_disable(struct alx_softc *);
+static void	alx_intr_disable(struct alx_softc *);
+static void	alx_intr_enable(struct alx_softc *);
 static int	alx_irq_legacy(void *);
 static int	alx_media_change(struct ifnet *);
 static void	alx_media_status(struct ifnet *, struct ifmediareq *);
@@ -443,6 +445,12 @@ alx_dma_alloc(struct alx_softc *sc)
 	}
 
 	return (error);
+}
+
+static void __unused
+alx_dma_free(struct alx_softc *sc)
+{
+
 }
 
 #if 0
@@ -1076,31 +1084,48 @@ void alx_disable_advanced_intr(struct alx_adapter *adpt)
 	alx_config_vector_mapping(adpt);
 }
 
-static void alx_irq_enable(struct alx_adapter *adpt)
-{
-	struct alx_hw *hw = &adpt->hw;
-	int i;
+#endif
 
+static void
+alx_intr_enable(struct alx_softc *sc)
+{
+	struct alx_hw *hw;
+#ifdef __notyet
+	int i;
+#endif
+
+#if 0
 	if (!atomic_dec_and_test(&adpt->irq_sem))
 		return;
+#endif
+
+	hw = &sc->hw;
+
+	/*
+	 * XXX the linux code has the following line here-ish:
+	 *
+	 * ALX_MEM_W32(hw, ALX_ISR, (uint32_t)~ALX_ISR_DIS)
+	 *
+	 * with the comment 'clear old interrupts.'
+	 */
 
 	/* level-1 interrupt switch */
 	ALX_MEM_W32(hw, ALX_ISR, 0);
 	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
 	ALX_MEM_FLUSH(hw);
 
-	if (!ALX_FLAG(adpt, USING_MSIX))
+	if (!ALX_FLAG(sc, USING_MSIX))
 		return;
 
+#ifdef __notyet
 	/* enable all individual MSIX IRQs */
 	for (i = 0; i < adpt->nr_vec; i++)
 		alx_mask_msix(hw, i, false);
+#endif
 }
 
-#endif
-
 static void
-alx_irq_disable(struct alx_softc *sc)
+alx_intr_disable(struct alx_softc *sc)
 {
 	struct alx_hw *hw = &sc->hw;
 	int i;
@@ -1516,60 +1541,6 @@ void alx_init_intr(struct alx_adapter *adpt)
 	}
 }
 
-static int __alx_open(struct alx_adapter *adpt, bool resume)
-{
-	int err;
-
-	/* decide interrupt mode, some resources allocation depend on it */
-	alx_init_intr(adpt);
-
-	/* init rss indirection table */
-	alx_init_def_rss_idt(adpt);
-
-	if (!resume)
-		netif_carrier_off(adpt->netdev);
-
-	/* allocate all memory resources */
-	err = alx_setup_all_ring_resources(adpt);
-	if (err)
-		goto err_out;
-
-	/* make hardware ready before allocate interrupt */
-	alx_configure(adpt);
-
-	err = alx_request_irq(adpt);
-	if (err)
-		goto err_out;
-
-	/* netif_set_real_num_tx/rx_queues need rtnl_lock held */
-	if (resume)
-		rtnl_lock();
-	netif_set_real_num_tx_queues(adpt->netdev, adpt->nr_txq);
-	netif_set_real_num_rx_queues(adpt->netdev, adpt->nr_rxq);
-	if (resume)
-		rtnl_unlock();
-
-	ALX_FLAG_CLEAR(adpt, HALT);
-
-	/* clear old interrupts */
-	ALX_MEM_W32(&adpt->hw, ALX_ISR, (u32)~ALX_ISR_DIS);
-
-	alx_irq_enable(adpt);
-
-	if (!resume)
-		netif_tx_start_all_queues(adpt->netdev);
-
-	ALX_FLAG_SET(adpt, TASK_CHK_LINK);
-	alx_schedule_work(adpt);
-	return 0;
-
-err_out:
-
-	alx_free_all_ring_resources(adpt);
-	alx_disable_advanced_intr(adpt);
-	return err;
-}
-
 static void alx_halt(struct alx_adapter *adpt, bool in_task)
 {
 	struct alx_hw *hw = &adpt->hw;
@@ -1604,54 +1575,6 @@ static void alx_activate(struct alx_adapter *adpt)
 
 	ALX_FLAG_SET(adpt, TASK_CHK_LINK);
 	alx_schedule_work(adpt);
-}
-
-static void alx_init_ring_ptrs(struct alx_adapter *adpt)
-{
-	struct alx_hw *hw = &adpt->hw;
-	struct alx_napi *np;
-	int i, tx_idx, rx_idx;
-	u32 addr_hi;
-	u16 txring_header_reg[] = {ALX_TPD_PRI0_ADDR_LO, ALX_TPD_PRI1_ADDR_LO,
-				   ALX_TPD_PRI2_ADDR_LO, ALX_TPD_PRI3_ADDR_LO};
-	u16 rfdring_header_reg[] = {ALX_RFD_ADDR_LO};
-	u16 rrdring_header_reg[] = {ALX_RRD_ADDR_LO};
-
-	tx_idx = 0;
-	rx_idx = 0;
-	for (i = 0; i < adpt->nr_napi; i++) {
-		np = adpt->qnapi[i];
-		if (np->rxq) {
-			np->rxq->pidx = 0;
-			np->rxq->cidx = 0;
-			np->rxq->rrd_cidx = 0;
-			if (!ALX_CAP(hw, MRQ) && rx_idx == 0) {
-				ALX_MEM_W32(hw, rfdring_header_reg[0],
-					    np->rxq->rfd_dma);
-				ALX_MEM_W32(hw, rrdring_header_reg[0],
-					    np->rxq->rrd_dma);
-			}
-			rx_idx++;
-		}
-		if (np->txq) {
-			np->txq->pidx = 0;
-			atomic_set(&np->txq->cidx, 0);
-			ALX_MEM_W32(hw, txring_header_reg[tx_idx],
-				np->txq->tpd_dma);
-			tx_idx++;
-		}
-	}
-
-	addr_hi = ((u64)adpt->ring_header.dma) >> 32;
-	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, addr_hi);
-	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, addr_hi);
-	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, adpt->tx_ringsz);
-	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, adpt->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, adpt->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, adpt->rxbuf_size);
-
-	/* load these ptrs into chip internal */
-	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
 }
 
 static void alx_show_speed(struct alx_adapter *adpt, u16 speed)
@@ -1769,33 +1692,6 @@ out:
 		ALX_FLAG_SET(adpt, TASK_RESET);
 		alx_schedule_work(adpt);
 	}
-}
-
-/* alx_open - Called when a network interface is made active */
-static int alx_open(struct net_device *netdev)
-{
-	struct alx_adapter *adpt = netdev_priv(netdev);
-	int err;
-
-	/* during diag running, disallow open */
-	if (ALX_FLAG(adpt, TESTING))
-		return -EBUSY;
-
-	err = __alx_open(adpt, false);
-
-	return err;
-}
-
-/* alx_stop - Disables a network interface */
-static int alx_stop(struct net_device *netdev)
-{
-	struct alx_adapter *adpt = netdev_priv(netdev);
-
-	WARN_ON(ALX_FLAG(adpt, RESETING));
-
-	__alx_stop(adpt);
-
-	return 0;
 }
 
 static int __alx_shutdown(struct pci_dev *pdev, bool *wol_en)
@@ -2702,14 +2598,23 @@ alx_init_locked(struct alx_softc *sc)
 	memcpy(hw->mac_addr, IF_LLADDR(ifp), ETHER_ADDR_LEN);
 	alx_set_macaddr(hw, hw->mac_addr);
 
-	ifp->if_drv_flags |= IFF_DRV_RUNNING;
-	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
-
 	alx_init_tx_ring(sc);
 	// alx_init_rx_ring(sc);
 
 	/* Load the DMA pointers. */
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
+
+	alx_configure_basic(hw);
+	alx_configure_rss(hw, 0 /* XXX */);
+	/*
+	 * XXX configure some VLAN rx strip thingy and some promiscuous mode
+	 * stuff and some multicast stuff.
+	 */
+
+	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+
+	alx_intr_enable(sc);
 }
 
 static void
@@ -2728,6 +2633,8 @@ alx_start_locked(struct ifnet *ifp)
 {
 
 	ALX_LOCK_ASSERT(sc);
+
+	printf("in alx_start_locked()\n");
 }
 
 static void
@@ -2740,7 +2647,7 @@ alx_stop(struct alx_softc *sc)
 	ifp = sc->alx_ifp;
 	ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
 
-	alx_irq_disable(sc);
+	alx_intr_disable(sc);
 
 	/* XXX what else? */
 }
@@ -2797,6 +2704,11 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 
 	dev = sc->alx_dev;
 
+	sc->nr_txq = 1;
+	sc->nr_rxq = 1; // XXX needed?
+	sc->nr_vec = 1;
+	sc->nr_hwrxq = 1;
+
 	rid = 0;
 	sc->alx_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
 	    RF_ACTIVE | RF_SHAREABLE);
@@ -2830,12 +2742,24 @@ alx_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 {
 	struct alx_softc *sc;
 	struct ifreq *ifr;
-	int error;
+	int error = 0;
 
 	sc = ifp->if_softc;
 	ifr = (struct ifreq *)data;
 
 	switch (command) {
+	case SIOCSIFFLAGS:
+		ALX_LOCK(sc);
+		if ((ifp->if_flags & IFF_UP) &&
+		    !(ifp->if_flags & IFF_DRV_RUNNING)) {
+			alx_init_locked(sc);
+		} else {
+			if (!(ifp->if_flags & IFF_DRV_RUNNING))
+				alx_stop(sc);
+		}
+		sc->alx_if_flags = ifp->if_flags;
+		ALX_UNLOCK(sc);
+		break;
 	case SIOCGIFMEDIA:
 		error = ifmedia_ioctl(ifp, ifr, &sc->alx_media, command);
 		break;

@@ -166,8 +166,6 @@ struct alx_softc {
 	int			nr_rxq;
 	/* number independent hw RX-Q */
 	int			nr_hwrxq;
-	/* total napi for TX-Q/RX-Q */
-	int			nr_napi;
 
 #ifdef notyet
 	/* lock for updating stats */
@@ -193,6 +191,7 @@ struct alx_softc {
 	struct resource		*alx_irq;
 	void			*alx_cookie;
         struct ifnet		*alx_ifp;
+	int			 alx_if_flags;
 
 	struct taskqueue	*alx_tq;
 	struct task		 alx_int_task;
