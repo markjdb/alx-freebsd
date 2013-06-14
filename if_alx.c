@@ -2670,7 +2670,7 @@ retry:
 	for (i = 0; i < nsegs; i++) {
 		first = sc->alx_tx_queue.pidx;
 		td = &sc->alx_tx_queue.tpd_hdr[first];
-		td->addr = htole64(seg.ds_addr);
+		td->adrl.addr = htole64(seg.ds_addr);
 		FIELD_SET32(td->word0, TPD_BUFLEN, seg.ds_len);
 	}
 
