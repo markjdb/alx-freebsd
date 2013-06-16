@@ -31,15 +31,10 @@ struct alx_ring_header {
 	uint32_t	 size;
 };
 
-/* alx_buffer wraps around a pointer to a socket buffer
- * so a DMA physical address can be stored along with the skb
- */
 struct alx_buffer {
-#ifdef notyet
-	struct sk_buff *skb;
-#endif
-	/* DMA address */
-	DEFINE_DMA_UNMAP_ADDR(dma);
+	struct mbuf	*m;
+	bus_dmamap_t	 dmamap;
+
 	/* buffer size */
 	DEFINE_DMA_UNMAP_LEN(size);
 	/* information of this buffer */
@@ -189,6 +184,9 @@ struct alx_softc {
 	bus_dma_tag_t		 alx_tx_tag;
 	bus_dmamap_t		 alx_tx_dmamap;
 
+        bus_dma_tag_t            alx_tx_buf_tag;
+        bus_dmamap_t             alx_tx_buf_dmamap; /* XXX do we need this? */
+
 	bus_dma_tag_t		 alx_rx_tag;
 	bus_dmamap_t		 alx_rx_dmamap;
 
@@ -211,6 +209,9 @@ struct alx_softc {
 	set_bit(ALX_FLAG_##_FLAG, &(_adpt)->flags))
 #define ALX_FLAG_CLEAR(_adpt, _FLAG) (\
 	clear_bit(ALX_FLAG_##_FLAG, &(_adpt)->flags))
+
+#define ALX_TX_INC(i, s)	(((i) + 1) % (s)->tx_ringsz)
+#define ALX_TX_DEC(i, s)	(((i) + (s)->tx_ringsz - 1) % (s)->tx_ringsz)
 
 #ifdef notyet
 static inline struct

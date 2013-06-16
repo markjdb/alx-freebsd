@@ -78,15 +78,13 @@ static struct alx_dev {
 	    "Qualcomm Atheros AR8172 Fast Ethernet" },
 };
 
-#define ALX_DEV_COUNT	(sizeof(alx_devs) / sizeof(alx_devs[0]))
-
 static int	alx_allocate_legacy_irq(struct alx_softc *);
 static int	alx_attach(device_t);
 static int	alx_detach(device_t);
 static int	alx_dma_alloc(struct alx_softc *);
 static void	alx_dma_free(struct alx_softc *);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
-static int	alx_encap(struct alx_softc *, struct mbuf **);
+static int	alx_xmit(struct alx_softc *, struct mbuf **);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
@@ -128,14 +126,6 @@ static devclass_t alx_devclass;
 DRIVER_MODULE(alx, pci, alx_driver, alx_devclass, 0, 0);
 
 #if 0
-static int alx_poll(struct napi_struct *napi, int budget);
-static irqreturn_t alx_msix_ring(int irq, void *data);
-static irqreturn_t alx_intr_msix_misc(int irq, void *data);
-static irqreturn_t alx_intr_msi(int irq, void *data);
-static irqreturn_t alx_intr_legacy(int irq, void *data);
-static void alx_init_ring_ptrs(struct alx_adapter *adpt);
-static int alx_reinit_rings(struct alx_adapter *adpt);
-
 static inline void alx_schedule_work(struct alx_adapter *adpt)
 {
 	if (!ALX_FLAG(adpt, HALT))
@@ -307,7 +297,8 @@ alx_dma_alloc(struct alx_softc *sc)
 {
 	device_t dev;
 	struct alx_hw *hw;
-	int error;
+	struct alx_buffer *buf;
+	int error, i;
 
 	dev = sc->alx_dev;
 	hw = &sc->hw;
@@ -332,7 +323,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	/* Create the DMA tag for the transmit packet descriptor ring. */
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
-	    bus_get_dma_tag(dev),		/* parent */
+	    sc->alx_parent_tag,			/* parent */
 	    8, 0,				/* alignment, boundary */
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
@@ -373,7 +364,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	/* Create the DMA tag for the receive ready descriptor ring. */
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
-	    bus_get_dma_tag(dev),		/* parent */
+	    sc->alx_parent_tag,			/* parent */
 	    8, 0,				/* alignment, boundary */
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
@@ -413,7 +404,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	/* Create the DMA tag for the receive ready descriptor ring. */
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
-	    bus_get_dma_tag(dev),		/* parent */
+	    sc->alx_parent_tag,			/* parent */
 	    8, 0,				/* alignment, boundary */
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
@@ -425,7 +416,9 @@ alx_dma_alloc(struct alx_softc *sc)
 	    NULL, NULL,				/* lockfunc, lockfuncarg */
 	    &sc->alx_rx_tag);
 	if (error != 0) {
-		device_printf(dev, "could not create RX descriptor ring tag\n");
+		device_printf(dev,
+		    "could not create RX descriptor ring DMA tag\n");
+		/* XXX cleanup */
 		return (error);
 	}
 
@@ -449,6 +442,47 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
+	/* Create the DMA tag for the transmit buffers. */
+	/* XXX where do maxsize, nsegments, maxsegsize come from? */
+	error = bus_dma_tag_create(
+	    sc->alx_parent_tag,			/* parent */
+	    1, 0,				/* alignment, boundary */
+	    BUS_SPACE_MAXADDR,			/* lowaddr */
+	    BUS_SPACE_MAXADDR,			/* highaddr */
+	    NULL, NULL,				/* filter, filterarg */
+	    65535 + sizeof(struct ether_vlan_header), /* maxsize */
+	    1,					/* nsegments */
+	    PAGE_SIZE,				/* maxsegsize */
+	    0,					/* flags */
+	    NULL, NULL,				/* lockfunc, lockarg */
+	    &sc->alx_tx_buf_tag);
+	if (error != 0) {
+		device_printf(dev, "could not create TX buffer DMA tag\n");
+		/* XXX cleanup */
+		return (error);
+	}
+
+	sc->alx_tx_queue.bf_info = malloc(
+	    sc->tx_ringsz * sizeof(struct alx_buffer), M_DEVBUF,
+	    M_NOWAIT | M_ZERO);
+	if (sc->alx_tx_queue.bf_info == NULL) {
+		device_printf(dev,
+		    "could not allocate memory for TX buffer ring\n");
+		/* XXX cleanup */
+		return (error);
+	}
+
+	/* Create DMA maps for TX buffers. */
+	buf = sc->alx_tx_queue.bf_info;
+	for (i = 0; i < sc->tx_ringsz; i++, buf++) {
+		error = bus_dmamap_create(sc->alx_tx_buf_tag, 0, &buf->dmamap);
+		if (error != 0) {
+			device_printf(dev, "coult not create TX DMA map\n");
+			/* XXX cleanup */
+			return (error);
+		}
+	}
+
 	return (error);
 }
 
@@ -459,88 +493,6 @@ alx_dma_free(struct alx_softc *sc)
 }
 
 #if 0
-static int
-alx_alloc_rings(struct alx_softc *sc)
-{
-	struct alx_buffer *bf;
-	u8 *desc;
-	dma_addr_t  dma;
-	int i, size, offset;
-
-	size = sizeof(struct alx_buffer) * adpt->nr_txq * adpt->tx_ringsz +
-	       sizeof(struct alx_buffer) * adpt->nr_hwrxq * adpt->rx_ringsz;
-
-	bf = vzalloc(size);
-	if (!bf)
-		goto err_out;
-
-	/* physical rx rings */
-	size = sizeof(struct tpd_desc) * adpt->tx_ringsz * adpt->nr_txq +
-	       (sizeof(struct rrd_desc) + sizeof(struct rfd_desc)) *
-	       adpt->rx_ringsz * adpt->nr_hwrxq +
-	       adpt->nr_txq * 8 +
-	       adpt->nr_hwrxq * 8;
-	desc = dma_alloc_coherent(&adpt->pdev->dev, size, &dma, GFP_KERNEL);
-	if (!desc)
-		goto err_out;
-
-	memset(desc, 0, size);
-	adpt->ring_header.desc = desc;
-	adpt->ring_header.dma = dma;
-	adpt->ring_header.size = size;
-
-	size = sizeof(struct tpd_desc) * adpt->tx_ringsz;
-	for (i = 0; i < adpt->nr_txq; i++) {
-		offset = ALIGN(dma, 8) - dma;
-		desc += offset;
-		dma += offset;
-		adpt->qnapi[i]->txq->netdev = adpt->netdev;
-		adpt->qnapi[i]->txq->dev = &adpt->pdev->dev;
-		adpt->qnapi[i]->txq->tpd_hdr = (struct tpd_desc *)desc;
-		adpt->qnapi[i]->txq->tpd_dma = dma;
-		adpt->qnapi[i]->txq->count = adpt->tx_ringsz;
-		adpt->qnapi[i]->txq->bf_info = bf;
-		desc += size;
-		dma += size;
-		bf += adpt->tx_ringsz;
-	}
-	size = sizeof(struct rrd_desc) * adpt->rx_ringsz;
-	for (i = 0; i < adpt->nr_hwrxq; i++) {
-		offset = ALIGN(dma, 8) - dma;
-		desc += offset;
-		dma += offset;
-		adpt->qnapi[i]->rxq->rrd_hdr = (struct rrd_desc *)desc;
-		adpt->qnapi[i]->rxq->rrd_dma = dma;
-		adpt->qnapi[i]->rxq->bf_info = bf;
-		desc += size;
-		dma += size;
-		bf += adpt->rx_ringsz;
-	}
-	size = sizeof(struct rfd_desc) * adpt->rx_ringsz;
-	for (i = 0; i < adpt->nr_hwrxq; i++) {
-		offset = ALIGN(dma, 8) - dma;
-		desc += offset;
-		dma += offset;
-		adpt->qnapi[i]->rxq->rfd_hdr = (struct rfd_desc *)desc;
-		adpt->qnapi[i]->rxq->rfd_dma = dma;
-		desc += size;
-		dma += size;
-	}
-	for (i = 0; i < adpt->nr_rxq; i++) {
-		adpt->qnapi[i]->rxq->netdev = adpt->netdev;
-		adpt->qnapi[i]->rxq->dev = &adpt->pdev->dev;
-		adpt->qnapi[i]->rxq->count = adpt->rx_ringsz;
-	}
-
-	return 0;
-
-err_out:
-	if (bf)
-		vfree(bf);
-
-	return -ENOMEM;
-}
-
 static void alx_free_rings(struct alx_adapter *adpt)
 {
 	struct alx_buffer *bf;
@@ -701,24 +653,6 @@ static void alx_free_rxring_buf(struct alx_rx_queue *rxq)
 	rxq->pidx = 0;
 	rxq->cidx = 0;
 	rxq->rrd_cidx = 0;
-}
-
-int
-alx_setup_all_ring_resources(struct alx_softc *sc)
-{
-	int err;
-
-	err = alx_alloc_rings(sc);
-	if (err)
-		goto out;
-
-	err = alx_reinit_rings(sc);
-
-out:
-	if (err != 0)
-		device_printf(sc->alx_dev, "failed to set up TX/RX rings\n");
-
-	return (err);
 }
 
 static void alx_txbuf_unmap_and_free(struct alx_tx_queue *txq, int entry)
@@ -1342,7 +1276,7 @@ alx_init_sw(struct alx_softc *sc)
 	hw->imask = ALX_ISR_MISC;
 	hw->dma_chnl = hw->max_dma_chnl;
 	hw->ith_tpd = sc->tx_ringsz / 3;
-	hw->link_up = false;
+	hw->link_up = true;
 	hw->link_duplex = 0;
 	hw->link_speed = SPEED_0;
 	hw->adv_cfg = ADVERTISED_Autoneg | ADVERTISED_10baseT_Half |
@@ -2558,19 +2492,31 @@ static void
 alx_init_tx_ring(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
+	struct alx_buffer *tx_buf;
+	int i;
 
 	ALX_LOCK_ASSERT(sc);
 
 	hw = &sc->hw;
 
 	sc->alx_tx_queue.pidx = 0;
+	sc->alx_tx_queue.p_reg = ALX_TPD_PRI0_PIDX;
 	sc->alx_tx_queue.cidx = 0;
-	sc->alx_tx_queue.count = 0;
+	sc->alx_tx_queue.c_reg = ALX_TPD_PRI0_CIDX;
+	sc->alx_tx_queue.count = sc->tx_ringsz;
+
+	hw->imask |= ALX_ISR_TX_Q0;
 
 	/* XXX multiple queues */
 	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
 	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma);
 	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
+
+	/* XXX iterate over buffer ring and reset everything. */
+	for (i = 0; i < sc->tx_ringsz; i++) {
+		tx_buf = &sc->alx_tx_queue.bf_info[i];
+		tx_buf->m = NULL;
+	}
 }
 
 static void
@@ -2623,21 +2569,33 @@ alx_init_locked(struct alx_softc *sc)
 }
 
 static int
-alx_encap(struct alx_softc *sc, struct mbuf **m_head)
+alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 {
 	struct mbuf *m;
-	struct tpd_desc *td;
 	bus_dma_segment_t seg;
-	int first, error, nsegs, i;
+	bus_dmamap_t map;
+	struct tpd_desc *td;
+	struct alx_buffer *tx_buf, *tx_buf_mapped;
+	int desci, error, nsegs, i;
+	uint16_t cidx;
 
 	ALX_LOCK_ASSERT(sc);
 
 	M_ASSERTPKTHDR(*m_head);
 
+	ALX_MEM_R16(&sc->hw, sc->alx_tx_queue.c_reg, &cidx);
+	printf("cidx is %u\n", cidx);
+
+	desci = sc->alx_tx_queue.pidx;
+	tx_buf = tx_buf_mapped = &sc->alx_tx_queue.bf_info[desci];
+	map = tx_buf->dmamap;
+
+	printf("using descriptor %d\n", desci);
+
 	/* XXX figure out how segments the DMA engine can support. */
 retry:
-	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_tag, sc->alx_tx_dmamap,
-	    *m_head, &seg, &nsegs, 0);
+	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, map, *m_head, &seg,
+	    &nsegs, 0);
 	if (error == EFBIG) {
 		m = m_collapse(*m_head, M_NOWAIT, 1);
 		if (m == NULL) {
@@ -2649,13 +2607,14 @@ retry:
 		*m_head = m;
 		/* XXX how do we guarantee this won't loop forever? */
 		goto retry;
-	} else
+	} else if (error != 0)
 		/* XXX increment counter? */
 		return (error);
 
 	if (nsegs == 0) {
 		m_freem(*m_head);
 		*m_head = NULL;
+		/* XXX increment counter? */
 		return (EIO);
 	}
 
@@ -2663,16 +2622,42 @@ retry:
 	/* XXX what's up with the - 2? It's in em(4) and age(4). */
 	if (nsegs > sc->alx_tx_queue.count - 2) {
 		/* XXX increment counter? */
-		bus_dmamap_unload(sc->alx_tx_tag, sc->alx_tx_dmamap);
+		bus_dmamap_unload(sc->alx_tx_tag, map);
 		return (ENOBUFS);
 	}
 
-	for (i = 0; i < nsegs; i++) {
-		first = sc->alx_tx_queue.pidx;
-		td = &sc->alx_tx_queue.tpd_hdr[first];
+	printf("nsegs is %d\n", nsegs);
+
+	for (i = 0; i < nsegs; i++, desci = ALX_TX_INC(desci, sc)) {
+		td = &sc->alx_tx_queue.tpd_hdr[desci];
+		/* XXX handle multiple segments. */
 		td->adrl.addr = htole64(seg.ds_addr);
 		FIELD_SET32(td->word0, TPD_BUFLEN, seg.ds_len);
+		td->word1 = 0;
 	}
+
+	/* This is the last descriptor for this packet. */
+	td->word1 |= 1 << TPD_EOP_SHIFT;
+
+	/* Update the producer index. */
+	sc->alx_tx_queue.pidx = desci;
+
+	/* Save the mbuf pointer so that we can unmap it later. */
+	tx_buf->m = *m_head;
+
+	/*
+	 * Swap the maps between the first and last descriptors so that the last
+	 * descriptor gets the real map. The first descriptor will end up with
+	 * an unused map.
+	 */
+	tx_buf_mapped->dmamap = tx_buf->dmamap;
+	tx_buf->dmamap = map;
+	bus_dmamap_sync(sc->alx_tx_buf_tag, map, BUS_DMASYNC_PREWRITE);
+
+	/* Let the hardware know that we're all set. */
+	bus_dmamap_sync(sc->alx_tx_tag, sc->alx_tx_dmamap,
+	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+	ALX_MEM_W16(&sc->hw, sc->alx_tx_queue.p_reg, desci);
 
 	return (0);
 }
@@ -2710,7 +2695,7 @@ alx_start_locked(struct ifnet *ifp)
 		if (m_head == NULL)
 			break;
 
-		if (alx_encap(sc, &m_head)) {
+		if (alx_xmit(sc, &m_head)) {
 			if (m_head != NULL)
 				IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
 			break;
@@ -2776,8 +2761,24 @@ alx_irq_legacy(void *arg)
 	hw = &sc->hw;
 
 	ALX_MEM_R32(hw, ALX_ISR, &intr);
+	printf("received legacy interrupt: 0x%x\n", intr);
+	intr &= hw->imask;
+
 	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
 		return (FILTER_STRAY);
+
+	/* Acknowledge the interrupt. */
+	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
+
+	if (intr & ALX_ISR_PHY) {
+		/* suppress PHY interrupt, because the source
+		 * is from PHY internal. only the internal status
+		 * is cleared, the interrupt status could be cleared.
+		 */
+		hw->imask &= ~ALX_ISR_PHY;
+		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
+		//ALX_FLAG_SET(adpt, TASK_CHK_LINK);
+	}
 
 	return (FILTER_HANDLED);
 }
@@ -2935,7 +2936,7 @@ alx_probe(device_t dev)
 	device = pci_get_device(dev);
 
 	alx = alx_devs;
-	for (i = 0; i < ALX_DEV_COUNT; i++, alx++) {
+	for (i = 0; i < sizeof(alx_devs) / sizeof(alx_devs[0]); i++, alx++) {
 		if (alx->alx_vendorid == vendor &&
 		    alx->alx_deviceid == device) {
 			device_set_desc(dev, alx->alx_name);
@@ -3035,7 +3036,7 @@ alx_attach(device_t dev)
 	ifp->if_softc = sc;
 	if_initname(ifp, device_get_name(dev), device_get_unit(dev));
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST; /* XXX */
-	ifp->if_capabilities = IFCAP_HWCSUM; /* XXX others? */
+	ifp->if_capabilities = 0; //IFCAP_HWCSUM; /* XXX others? */
 	ifp->if_ioctl = alx_ioctl;
 	ifp->if_start = alx_start;
 	ifp->if_init = alx_init;
@@ -3056,27 +3057,6 @@ alx_attach(device_t dev)
 		    NULL);
 	}
 	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
-
-#if 0
-	netdev->netdev_ops = &alx_netdev_ops;
-	alx_set_ethtool_ops(netdev);
-	netdev->irq  = pdev->irq;
-	netdev->watchdog_timeo = ALX_WATCHDOG_TIME;
-
-	/* PHY mdio */
-	hw->mdio.prtad = 0;
-	hw->mdio.mmds = 0;
-	hw->mdio.dev = netdev;
-	hw->mdio.mode_support =
-		MDIO_SUPPORTS_C45 | MDIO_SUPPORTS_C22 | MDIO_EMULATE_C22;
-	hw->mdio.mdio_read = alx_mdio_read;
-	hw->mdio.mdio_write = alx_mdio_write;
-	if (!alx_get_phy_info(hw)) {
-		device_printf(dev, "identify PHY failed\n");
-		err = -EIO;
-		goto err_id_phy;
-	}
-#endif
 
 fail:
 	if (err != 0)
