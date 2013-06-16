@@ -84,10 +84,11 @@ static int	alx_detach(device_t);
 static int	alx_dma_alloc(struct alx_softc *);
 static void	alx_dma_free(struct alx_softc *);
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
-static int	alx_xmit(struct alx_softc *, struct mbuf **);
+static void	alx_handle_link(void *, int);
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
+static void	alx_init_rx_ring(struct alx_softc *);
 static void	alx_init_tx_ring(struct alx_softc *);
 static void	alx_int_task(void *, int);
 static void	alx_intr_disable(struct alx_softc *);
@@ -103,6 +104,7 @@ static void	alx_start(struct ifnet *);
 static void	alx_start_locked(struct ifnet *);
 static void	alx_stop(struct alx_softc *);
 static int	alx_suspend(device_t);
+static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
 static device_method_t alx_methods[] = {
 	DEVMETHOD(device_probe,		alx_probe),
@@ -446,7 +448,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	/* XXX where do maxsize, nsegments, maxsegsize come from? */
 	error = bus_dma_tag_create(
 	    sc->alx_parent_tag,			/* parent */
-	    1, 0,				/* alignment, boundary */
+	    8, 0,				/* alignment, boundary */
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
@@ -1033,20 +1035,10 @@ alx_intr_enable(struct alx_softc *sc)
 	int i;
 #endif
 
-#if 0
-	if (!atomic_dec_and_test(&adpt->irq_sem))
+	if (atomic_fetchadd_int(&sc->irq_sem, -1) != 1)
 		return;
-#endif
 
 	hw = &sc->hw;
-
-	/*
-	 * XXX the linux code has the following line here-ish:
-	 *
-	 * ALX_MEM_W32(hw, ALX_ISR, (uint32_t)~ALX_ISR_DIS)
-	 *
-	 * with the comment 'clear old interrupts.'
-	 */
 
 	/* level-1 interrupt switch */
 	ALX_MEM_W32(hw, ALX_ISR, 0);
@@ -1069,7 +1061,7 @@ alx_intr_disable(struct alx_softc *sc)
 	struct alx_hw *hw = &sc->hw;
 	int i;
 
-	//atomic_inc(&adpt->irq_sem);
+	atomic_add_int(&sc->irq_sem, 1);
 
 	ALX_MEM_W32(hw, ALX_ISR, ALX_ISR_DIS);
 	ALX_MEM_W32(hw, ALX_IMR, 0);
@@ -1268,17 +1260,17 @@ alx_init_sw(struct alx_softc *sc)
 	hw->rss_hash_type = ALX_RSS_HASH_TYPE_ALL;
 	hw->smb_timer = 400;
 	hw->mtu = 1500; // XXX sc->alx_ifp->if_mtu;
-	sc->rxbuf_size = ALX_RAW_MTU(hw->mtu) << 8;
+	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
 	sc->tx_ringsz = 256;
 	sc->rx_ringsz = 512;
 	hw->sleep_ctrl = ALX_SLEEP_WOL_MAGIC | ALX_SLEEP_WOL_PHY;
 	hw->imt = 200;
-	hw->imask = ALX_ISR_MISC;
+	hw->imask = ALX_ISR_MISC | ALX_ISR_PHY;
 	hw->dma_chnl = hw->max_dma_chnl;
 	hw->ith_tpd = sc->tx_ringsz / 3;
-	hw->link_up = true;
+	hw->link_up = false;
 	hw->link_duplex = 0;
-	hw->link_speed = SPEED_0;
+	hw->link_speed = 0;
 	hw->adv_cfg = ADVERTISED_Autoneg | ADVERTISED_10baseT_Half |
 	    ADVERTISED_10baseT_Full | ADVERTISED_100baseT_Full |
 	    ADVERTISED_100baseT_Half | ADVERTISED_1000baseT_Full;
@@ -1293,7 +1285,6 @@ alx_init_sw(struct alx_softc *sc)
 	    FIELDX(ALX_MAC_CTRL_PRMBLEN, 7);
 	hw->is_fpga = false;
 
-	//atomic_set(&adpt->irq_sem, 1);
 	sc->irq_sem = 1;
 	ALX_FLAG_SET(sc, HALT);
 
@@ -2489,6 +2480,30 @@ static void alx_poll_controller(struct net_device *netdev)
 #endif
 
 static void
+alx_init_rx_ring(struct alx_softc *sc)
+{
+	struct alx_hw *hw;
+
+	ALX_LOCK_ASSERT(sc);
+
+	hw = &sc->hw;
+
+	sc->alx_rx_queue.pidx = 0;
+	sc->alx_rx_queue.p_reg = ALX_RFD_PIDX;
+	sc->alx_rx_queue.cidx = 0;
+	sc->alx_rx_queue.c_reg = ALX_RFD_CIDX;
+	sc->alx_rx_queue.qidx = 0;
+	sc->alx_rx_queue.count = sc->rx_ringsz;
+
+	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma & 0xffffffff);
+	ALX_MEM_W32(hw, ALX_RRD_ADDR_LO, sc->alx_rx_queue.rrd_dma & 0xffffffff);
+	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, sc->alx_rx_queue.rfd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
+}
+
+static void
 alx_init_tx_ring(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
@@ -2503,14 +2518,15 @@ alx_init_tx_ring(struct alx_softc *sc)
 	sc->alx_tx_queue.p_reg = ALX_TPD_PRI0_PIDX;
 	sc->alx_tx_queue.cidx = 0;
 	sc->alx_tx_queue.c_reg = ALX_TPD_PRI0_CIDX;
+	sc->alx_tx_queue.qidx = 0;
 	sc->alx_tx_queue.count = sc->tx_ringsz;
 
 	hw->imask |= ALX_ISR_TX_Q0;
 
 	/* XXX multiple queues */
-	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
-	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma);
+	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma & 0xffffffff);
 	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
 
 	/* XXX iterate over buffer ring and reset everything. */
 	for (i = 0; i < sc->tx_ringsz; i++) {
@@ -2538,8 +2554,13 @@ alx_init_locked(struct alx_softc *sc)
 
 	ALX_LOCK_ASSERT(sc);
 
+	printf("in alx_init_locked\n");
+
 	ifp = sc->alx_ifp;
 	hw = &sc->hw;
+
+	if (ifp->if_drv_flags & IFF_DRV_RUNNING)
+		return;
 
 	alx_stop(sc);
 
@@ -2549,8 +2570,8 @@ alx_init_locked(struct alx_softc *sc)
 	memcpy(hw->mac_addr, IF_LLADDR(ifp), ETHER_ADDR_LEN);
 	alx_set_macaddr(hw, hw->mac_addr);
 
+	alx_init_rx_ring(sc);
 	alx_init_tx_ring(sc);
-	// alx_init_rx_ring(sc);
 
 	/* Load the DMA pointers. */
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
@@ -2565,6 +2586,7 @@ alx_init_locked(struct alx_softc *sc)
 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
 	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
 
+	ALX_MEM_W32(hw, ALX_ISR, (uint32_t)~ALX_ISR_DIS);
 	alx_intr_enable(sc);
 }
 
@@ -2687,8 +2709,8 @@ alx_start_locked(struct ifnet *ifp)
 	if ((ifp->if_drv_flags & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
 	    IFF_DRV_RUNNING)
 		return;
-
-	/* XXX check link here. */
+	if (!sc->hw.link_up)
+		return;
 
 	while (!IFQ_DRV_IS_EMPTY(&ifp->if_snd)) {
 		IFQ_DRV_DEQUEUE(&ifp->if_snd, m_head);
@@ -2714,6 +2736,8 @@ alx_stop(struct alx_softc *sc)
 	struct ifnet *ifp;
 
 	ALX_LOCK_ASSERT(sc);
+
+	printf("in alx_stop\n");
 
 	ifp = sc->alx_ifp;
 	ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
@@ -2750,6 +2774,88 @@ alx_int_task(void *context __unused, int pending __unused)
 {
 }
 
+static void
+alx_handle_link(void *arg, int pending __unused)
+{
+	struct ifnet *ifp;
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+	bool link_up, prev_link_up;
+	int error;
+	uint16_t speed, prev_speed;
+
+	sc = arg;
+	hw = &sc->hw;
+	ifp = sc->alx_ifp;
+
+	printf("running alx_handle_link\n");
+
+	ALX_LOCK(sc);
+
+	alx_clear_phy_intr(hw);
+
+	error = alx_get_phy_link(hw, &link_up, &speed);
+	if (error != 0) {
+		printf("error from alx_get_phy_link\n");
+		goto done;
+	}
+
+	printf("link_up: %d, speed: %d\n", link_up ? 1 : 0, speed);
+
+	hw->imask |= ALX_ISR_PHY;
+	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
+
+	if ((!link_up && !hw->link_up) ||
+	    (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+		goto done;
+
+	printf("setting the vars\n");
+
+	prev_speed = hw->link_speed + hw->link_duplex;
+	prev_link_up = hw->link_up;
+
+	hw->link_up = link_up;
+	if (link_up) {
+		if (prev_link_up && prev_speed == speed)
+			goto done;
+
+		hw->link_duplex = speed % 10;
+		hw->link_speed = speed - hw->link_duplex;
+
+		printf("link is up\n");
+
+		alx_post_phy_link(hw, hw->link_speed, ALX_CAP(hw, AZ));
+		alx_enable_aspm(hw, ALX_CAP(hw, L0S), ALX_CAP(hw, L1));
+		alx_start_mac(hw);
+
+		if_link_state_change(ifp, LINK_STATE_UP);
+	} else {
+		hw->link_duplex = 0;
+		hw->link_speed = 0;
+
+		printf("link is not up\n");
+
+		error = alx_reset_mac(hw);
+		if (error != 0) {
+			device_printf(sc->alx_dev, "failed to reset MAC\n");
+			goto done;
+		}
+
+		alx_intr_disable(sc);
+		/* XXX refresh rings */
+		alx_configure_basic(hw);
+		alx_configure_rss(hw, 0 /* XXX */);
+		alx_enable_aspm(hw, false, ALX_CAP(hw, L1));
+		alx_post_phy_link(hw, 0, ALX_CAP(hw, AZ));
+		alx_intr_enable(sc);
+
+		if_link_state_change(ifp, LINK_STATE_DOWN);
+	}
+
+done:
+	ALX_UNLOCK(sc);
+}
+
 static int
 alx_irq_legacy(void *arg)
 {
@@ -2762,23 +2868,28 @@ alx_irq_legacy(void *arg)
 
 	ALX_MEM_R32(hw, ALX_ISR, &intr);
 	printf("received legacy interrupt: 0x%x\n", intr);
-	intr &= hw->imask;
 
-	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
+	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0) {
+		printf("received stray interrupt?\n");
 		return (FILTER_STRAY);
+	}
 
 	/* Acknowledge the interrupt. */
 	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
+	intr &= hw->imask;
 
 	if (intr & ALX_ISR_PHY) {
+		printf("handling PHY interrupt\n");
 		/* suppress PHY interrupt, because the source
 		 * is from PHY internal. only the internal status
 		 * is cleared, the interrupt status could be cleared.
 		 */
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
-		//ALX_FLAG_SET(adpt, TASK_CHK_LINK);
+		taskqueue_enqueue(taskqueue_fast, &sc->alx_link_task);
 	}
+
+	ALX_MEM_W32(hw, ALX_ISR, 0);
 
 	return (FILTER_HANDLED);
 }
@@ -2818,6 +2929,7 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 		return (ENXIO);
 	}
 	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
+	TASK_INIT(&sc->alx_link_task, 0, alx_handle_link, sc);
 	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
 	    device_get_nameunit(sc->alx_dev));
 
@@ -2870,34 +2982,23 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
 	struct alx_softc *sc;
 	struct alx_hw *hw;
-	uint16_t speed, mode;
-	bool link_up;
-	int error;
 
 	sc = ifp->if_softc;
 	hw = &sc->hw;
 
+	ALX_LOCK(sc);
+
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
 
-	/*
-	 * Clear the PHY internal interrupt status. XXX why?
-	 */
-	alx_clear_phy_intr(hw);
-
-	error = alx_get_phy_link(hw, &link_up, &speed);
-	if (error != 0)
-		return;
-
-	if (link_up)
+	if (hw->link_up)
 		ifmr->ifm_status |= IFM_ACTIVE;
-	else
+	else {
+		ALX_UNLOCK(sc);
 		return;
+	}
 
-	mode = speed % 10;
-	speed -= mode;
-
-	switch (mode) {
+	switch (hw->link_duplex) {
 	case ALX_FULL_DUPLEX:
 		ifmr->ifm_active |= IFM_FDX;
 		break;
@@ -2905,11 +3006,12 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		ifmr->ifm_active |= IFM_HDX;
 		break;
 	default:
-		device_printf(sc->alx_dev, "invalid duplex mode %u\n", mode);
+		device_printf(sc->alx_dev, "invalid duplex mode %u\n",
+		    hw->link_duplex);
 		break;
 	}
 
-	switch (speed) {
+	switch (hw->link_speed) {
 	case SPEED_10:
 		ifmr->ifm_active |= IFM_10_T;
 		break;
@@ -2920,9 +3022,12 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		ifmr->ifm_active |= IFM_1000_T;
 		break;
 	default:
-		device_printf(sc->alx_dev, "invalid link speed %u\n", speed);
+		device_printf(sc->alx_dev, "invalid link speed %u\n",
+		    hw->link_speed);
 		break;
 	}
+
+	ALX_UNLOCK(sc);
 }
 
 static int
@@ -2971,6 +3076,7 @@ alx_attach(device_t dev)
 		device_printf(dev, "cannot allocate memory resources\n");
 		return (ENXIO);
 	}
+
 	hw = &sc->hw;
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
@@ -2999,6 +3105,7 @@ alx_attach(device_t dev)
 
 	if (!phy_cfged)
 		alx_reset_phy(hw, !hw->hib_patch);
+
 	err = alx_reset_mac(hw);
 	if (err) {
 		device_printf(dev, "MAC reset failed with error %d\n", err);
@@ -3024,6 +3131,12 @@ alx_attach(device_t dev)
 		goto fail;
 	}
 	memcpy(&hw->mac_addr, &hw->perm_addr, ETHER_ADDR_LEN);
+
+	if (!alx_get_phy_info(hw)) {
+		device_printf(dev, "failed to identify PHY\n");
+		err = ENXIO;
+		goto fail;
+	}
 
 	sc->alx_ifp = if_alloc(IFT_ETHER);
 	if (sc->alx_ifp == NULL) {
@@ -3084,8 +3197,8 @@ alx_detach(device_t dev)
 	bus_generic_detach(dev);
 	/* XXX Free DMA */
 
-	ether_ifdetach(sc->alx_ifp);
 	if (sc->alx_ifp != NULL) {
+		ether_ifdetach(sc->alx_ifp);
 		if_free(sc->alx_ifp);
 		sc->alx_ifp = NULL;
 	}

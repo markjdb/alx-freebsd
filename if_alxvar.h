@@ -44,17 +44,14 @@ struct alx_buffer {
 
 /* rx queue */
 struct alx_rx_queue {
-	struct net_device *netdev;
-	/* device pointer for dma operation */
-	struct device *dev;
 	/* rrd ring virtual addr */
 	struct rrd_desc *rrd_hdr;
 	/* rrd ring physical addr */
-	bus_dmamap_t rrd_dma;
+	dma_addr_t rrd_dma;
 	/* rfd ring virtual addr */
 	struct rfd_desc *rfd_hdr;
 	/* rfd ring physical addr */
-	bus_dmamap_t rfd_dma;
+	dma_addr_t rfd_dma;
 	/* info for rx-skbs */
 	struct alx_buffer *bf_info;
 
@@ -178,6 +175,7 @@ struct alx_softc {
 
 	struct taskqueue	*alx_tq;
 	struct task		 alx_int_task;
+        struct task              alx_link_task;
 
 	bus_dma_tag_t		 alx_parent_tag;
 
