@@ -78,33 +78,39 @@ static struct alx_dev {
 	    "Qualcomm Atheros AR8172 Fast Ethernet" },
 };
 
-static int	alx_allocate_legacy_irq(struct alx_softc *);
 static int	alx_attach(device_t);
-static void	alx_check_link(struct alx_softc *);
 static int	alx_detach(device_t);
-static int	alx_dma_alloc(struct alx_softc *);
-static void	alx_dma_free(struct alx_softc *);
-static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
-static void	alx_handle_link(void *, int);
+static int	alx_probe(device_t);
+static int	alx_resume(device_t);
+static int	alx_shutdown(device_t);
+static void	alx_stop(struct alx_softc *);
+static int	alx_suspend(device_t);
+
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
-static void	alx_init_rx_ring(struct alx_softc *);
-static void	alx_init_tx_ring(struct alx_softc *);
+static int	alx_media_change(struct ifnet *);
+static void	alx_media_status(struct ifnet *, struct ifmediareq *);
+static void	alx_start(struct ifnet *);
+static void	alx_start_locked(struct ifnet *);
+
+static int	alx_allocate_legacy_irq(struct alx_softc *);
+static void	alx_free_legacy_irq(struct alx_softc *);
+static void	alx_link_task(void *, int);
 static void	alx_int_task(void *, int);
 static void	alx_intr_disable(struct alx_softc *);
 static void	alx_intr_enable(struct alx_softc *);
 static int	alx_irq_legacy(void *);
-static int	alx_media_change(struct ifnet *);
-static void	alx_media_status(struct ifnet *, struct ifmediareq *);
-static int	alx_probe(device_t);
+
 static void	alx_reset(struct alx_softc *sc);
-static int	alx_resume(device_t);
-static int	alx_shutdown(device_t);
-static void	alx_start(struct ifnet *);
-static void	alx_start_locked(struct ifnet *);
-static void	alx_stop(struct alx_softc *);
-static int	alx_suspend(device_t);
+static void	alx_update_link(struct alx_softc *);
+
+static int	alx_dma_alloc(struct alx_softc *);
+static void	alx_dma_free(struct alx_softc *);
+static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
+
+static void	alx_init_rx_ring(struct alx_softc *);
+static void	alx_init_tx_ring(struct alx_softc *);
 static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
 static device_method_t alx_methods[] = {
@@ -605,61 +611,6 @@ alx_init_tx_ring(struct alx_softc *sc)
 	}
 }
 
-static void
-alx_init(void *arg)
-{
-	struct alx_softc *sc;
-
-	sc = arg;
-	ALX_LOCK(sc);
-	alx_init_locked(sc);
-	ALX_UNLOCK(sc);
-}
-
-static void
-alx_init_locked(struct alx_softc *sc)
-{
-	struct ifnet *ifp;
-	struct alx_hw *hw;
-
-	ALX_LOCK_ASSERT(sc);
-
-	ifp = sc->alx_ifp;
-	hw = &sc->hw;
-
-	if (ifp->if_drv_flags & IFF_DRV_RUNNING)
-		return;
-
-	alx_stop(sc);
-
-	/* Reset to a known good state. */
-	alx_reset(sc);
-
-	memcpy(hw->mac_addr, IF_LLADDR(ifp), ETHER_ADDR_LEN);
-	alx_set_macaddr(hw, hw->mac_addr);
-
-	alx_init_rx_ring(sc);
-	alx_init_tx_ring(sc);
-
-	/* Load the DMA pointers. */
-	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
-
-	alx_configure_basic(hw);
-	alx_configure_rss(hw, 0 /* XXX */);
-	/*
-	 * XXX configure some VLAN rx strip thingy and some promiscuous mode
-	 * stuff and some multicast stuff.
-	 */
-
-	ifp->if_drv_flags |= IFF_DRV_RUNNING;
-	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
-
-	alx_check_link(sc);
-
-	ALX_MEM_W32(hw, ALX_ISR, (uint32_t)~ALX_ISR_DIS);
-	alx_intr_enable(sc);
-}
-
 static int
 alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 {
@@ -750,50 +701,6 @@ retry:
 }
 
 static void
-alx_start(struct ifnet *ifp)
-{
-	struct alx_softc *sc = ifp->if_softc;
-
-	if (!(ifp->if_drv_flags & IFF_DRV_RUNNING))
-		return;
-
-	ALX_LOCK(sc);
-	alx_start_locked(ifp);
-	ALX_UNLOCK(sc);
-}
-
-static void
-alx_start_locked(struct ifnet *ifp)
-{
-	struct alx_softc *sc;
-	struct mbuf *m_head;
-
-	sc = ifp->if_softc;
-	ALX_LOCK_ASSERT(sc);
-
-	if ((ifp->if_drv_flags & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
-	    IFF_DRV_RUNNING || !sc->hw.link_up)
-		return;
-
-	while (!IFQ_DRV_IS_EMPTY(&ifp->if_snd)) {
-		IFQ_DRV_DEQUEUE(&ifp->if_snd, m_head);
-		if (m_head == NULL)
-			break;
-
-		if (alx_xmit(sc, &m_head)) {
-			if (m_head != NULL)
-				IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
-			break;
-		}
-
-		/* Let BPF listeners know about this frame. */
-		ETHER_BPF_MTAP(ifp, m_head);
-	}
-
-	/* XXX start wdog */
-}
-
-static void
 alx_stop(struct alx_softc *sc)
 {
 	struct ifnet *ifp;
@@ -831,15 +738,7 @@ alx_reset(struct alx_softc *sc)
 }
 
 static void
-alx_int_task(void *context, int pending __unused)
-{
-	struct alx_softc *sc;
-
-	sc = context;
-}
-
-static void
-alx_check_link(struct alx_softc *sc)
+alx_update_link(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
 	bool link_up, prev_link_up;
@@ -897,7 +796,15 @@ alx_check_link(struct alx_softc *sc)
 }
 
 static void
-alx_handle_link(void *arg, int pending __unused)
+alx_int_task(void *context, int pending __unused)
+{
+	struct alx_softc *sc;
+
+	sc = context;
+}
+
+static void
+alx_link_task(void *arg, int pending __unused)
 {
 	struct alx_softc *sc;
 	struct alx_hw *hw;
@@ -912,7 +819,7 @@ alx_handle_link(void *arg, int pending __unused)
 	hw->imask |= ALX_ISR_PHY;
 	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
 
-	alx_check_link(sc);
+	alx_update_link(sc);
 
 	ALX_UNLOCK(sc);
 }
@@ -938,7 +845,7 @@ alx_irq_legacy(void *arg)
 	if (intr & ALX_ISR_PHY) {
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
-		taskqueue_enqueue(taskqueue_fast, &sc->alx_link_task);
+		taskqueue_enqueue(taskqueue_swi, &sc->alx_link_task);
 	}
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
@@ -946,7 +853,7 @@ alx_irq_legacy(void *arg)
 	return (FILTER_HANDLED);
 }
 
-int
+static int
 alx_allocate_legacy_irq(struct alx_softc *sc)
 {
 	device_t dev;
@@ -981,45 +888,31 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 		return (ENXIO);
 	}
 	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
-	TASK_INIT(&sc->alx_link_task, 0, alx_handle_link, sc);
+	TASK_INIT(&sc->alx_link_task, 0, alx_link_task, sc);
 	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
 	    device_get_nameunit(sc->alx_dev));
 
 	return (0);
 }
 
-static int
-alx_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
+static void
+alx_free_legacy_irq(struct alx_softc *sc)
 {
-	struct alx_softc *sc;
-	struct ifreq *ifr;
-	int error = 0;
+	device_t dev;
 
-	sc = ifp->if_softc;
-	ifr = (struct ifreq *)data;
+	dev = sc->alx_dev;
 
-	switch (command) {
-	case SIOCSIFFLAGS:
-		ALX_LOCK(sc);
-		if ((ifp->if_flags & IFF_UP) &&
-		    !(ifp->if_flags & IFF_DRV_RUNNING)) {
-			alx_init_locked(sc);
-		} else {
-			if (!(ifp->if_flags & IFF_DRV_RUNNING))
-				alx_stop(sc);
-		}
-		sc->alx_if_flags = ifp->if_flags;
-		ALX_UNLOCK(sc);
-		break;
-	case SIOCGIFMEDIA:
-		error = ifmedia_ioctl(ifp, ifr, &sc->alx_media, command);
-		break;
-	default:
-		error = ether_ioctl(ifp, command, data);
-		break;
+	if (sc->alx_tq != NULL) {
+		taskqueue_drain(sc->alx_tq, &sc->alx_int_task);
+		taskqueue_drain(taskqueue_swi, &sc->alx_link_task);
+		taskqueue_free(sc->alx_tq);
 	}
 
-	return (error);
+	if (sc->alx_cookie != NULL)
+		bus_teardown_intr(dev, sc->alx_irq, sc->alx_cookie);
+
+	if (sc->alx_irq != NULL)
+		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->alx_irq);
 }
 
 static int
@@ -1080,6 +973,139 @@ alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 	}
 
 	ALX_UNLOCK(sc);
+}
+
+static int
+alx_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
+{
+	struct alx_softc *sc;
+	struct ifreq *ifr;
+	int error = 0;
+
+	sc = ifp->if_softc;
+	ifr = (struct ifreq *)data;
+
+	switch (command) {
+	case SIOCSIFFLAGS:
+		ALX_LOCK(sc);
+		if ((ifp->if_flags & IFF_UP) &&
+		    !(ifp->if_flags & IFF_DRV_RUNNING)) {
+			alx_init_locked(sc);
+		} else {
+			if (!(ifp->if_flags & IFF_DRV_RUNNING))
+				alx_stop(sc);
+		}
+		sc->alx_if_flags = ifp->if_flags;
+		ALX_UNLOCK(sc);
+		break;
+	case SIOCGIFMEDIA:
+		error = ifmedia_ioctl(ifp, ifr, &sc->alx_media, command);
+		break;
+	default:
+		error = ether_ioctl(ifp, command, data);
+		break;
+	}
+
+	return (error);
+}
+
+static void
+alx_init(void *arg)
+{
+	struct alx_softc *sc;
+
+	sc = arg;
+	ALX_LOCK(sc);
+	alx_init_locked(sc);
+	ALX_UNLOCK(sc);
+}
+
+static void
+alx_init_locked(struct alx_softc *sc)
+{
+	struct ifnet *ifp;
+	struct alx_hw *hw;
+
+	ALX_LOCK_ASSERT(sc);
+
+	ifp = sc->alx_ifp;
+	hw = &sc->hw;
+
+	if (ifp->if_drv_flags & IFF_DRV_RUNNING)
+		return;
+
+	alx_stop(sc);
+
+	/* Reset to a known good state. */
+	alx_reset(sc);
+
+	memcpy(hw->mac_addr, IF_LLADDR(ifp), ETHER_ADDR_LEN);
+	alx_set_macaddr(hw, hw->mac_addr);
+
+	alx_init_rx_ring(sc);
+	alx_init_tx_ring(sc);
+
+	/* Load the DMA pointers. */
+	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
+
+	alx_configure_basic(hw);
+	alx_configure_rss(hw, 0 /* XXX */);
+	/*
+	 * XXX configure some VLAN rx strip thingy and some promiscuous mode
+	 * stuff and some multicast stuff.
+	 */
+
+	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+
+	alx_update_link(sc);
+
+	ALX_MEM_W32(hw, ALX_ISR, (uint32_t)~ALX_ISR_DIS);
+	alx_intr_enable(sc);
+}
+
+static void
+alx_start(struct ifnet *ifp)
+{
+	struct alx_softc *sc = ifp->if_softc;
+
+	if (!(ifp->if_drv_flags & IFF_DRV_RUNNING))
+		return;
+
+	ALX_LOCK(sc);
+	alx_start_locked(ifp);
+	ALX_UNLOCK(sc);
+}
+
+static void
+alx_start_locked(struct ifnet *ifp)
+{
+	struct alx_softc *sc;
+	struct mbuf *m_head;
+
+	sc = ifp->if_softc;
+	ALX_LOCK_ASSERT(sc);
+
+	if ((ifp->if_drv_flags & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING || !sc->hw.link_up)
+		return;
+
+	while (!IFQ_DRV_IS_EMPTY(&ifp->if_snd)) {
+		IFQ_DRV_DEQUEUE(&ifp->if_snd, m_head);
+		if (m_head == NULL)
+			break;
+
+		if (alx_xmit(sc, &m_head)) {
+			if (m_head != NULL)
+				IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
+			break;
+		}
+
+		/* Let BPF listeners know about this frame. */
+		ETHER_BPF_MTAP(ifp, m_head);
+	}
+
+	/* XXX start wdog */
 }
 
 static int
@@ -1260,16 +1286,7 @@ alx_detach(device_t dev)
 		sc->alx_ifp = NULL;
 	}
 
-	if (sc->alx_tq != NULL) {
-		taskqueue_drain(sc->alx_tq, &sc->alx_int_task);
-		taskqueue_free(sc->alx_tq);
-	}
-
-	if (sc->alx_cookie != NULL)
-		bus_teardown_intr(dev, sc->alx_irq, sc->alx_cookie);
-
-	if (sc->alx_irq != NULL)
-		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->alx_irq);
+	alx_free_legacy_irq(sc);
 
 	if (sc->alx_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, PCIR_BAR(0),
