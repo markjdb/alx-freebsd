@@ -836,10 +836,9 @@ alx_int_task(void *context, int pending __unused)
 	struct alx_softc *sc;
 
 	sc = context;
-	//alx_intr_enable(sc);
 }
 
-static void __unused
+static void
 alx_check_link(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
@@ -947,7 +946,7 @@ alx_irq_legacy(void *arg)
 	return (FILTER_HANDLED);
 }
 
-int __unused
+int
 alx_allocate_legacy_irq(struct alx_softc *sc)
 {
 	device_t dev;
