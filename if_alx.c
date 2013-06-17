@@ -31,6 +31,7 @@
 #include <sys/rman.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 
 #include <net/bpf.h>
@@ -94,13 +95,14 @@ static void	alx_media_status(struct ifnet *, struct ifmediareq *);
 static void	alx_start(struct ifnet *);
 static void	alx_start_locked(struct ifnet *);
 
-static int	alx_allocate_legacy_irq(struct alx_softc *);
-static void	alx_free_legacy_irq(struct alx_softc *);
+static int	alx_alloc_intr(struct alx_softc *);
+static void	alx_free_intr(struct alx_softc *);
 static void	alx_link_task(void *, int);
 static void	alx_int_task(void *, int);
 static void	alx_intr_disable(struct alx_softc *);
 static void	alx_intr_enable(struct alx_softc *);
-static int	alx_irq_legacy(void *);
+static int	alx_intr_legacy(void *);
+static int	alx_intr_msi(void *);
 
 static void	alx_reset(struct alx_softc *sc);
 static void	alx_update_link(struct alx_softc *);
@@ -133,6 +135,18 @@ static driver_t alx_driver = {
 static devclass_t alx_devclass;
 
 DRIVER_MODULE(alx, pci, alx_driver, alx_devclass, 0, 0);
+
+static SYSCTL_NODE(_hw, OID_AUTO, alx, CTLFLAG_RD, 0, "alx driver settings");
+
+static int alx_enable_msix = 0;
+TUNABLE_INT("hw.alx.enable_msix", &alx_enable_msix);
+SYSCTL_INT(_hw_alx, OID_AUTO, enable_msix, CTLFLAG_RDTUN, &alx_enable_msix,
+    0, "Enable MSI-X interrupts");
+
+static int alx_enable_msi = 0;
+TUNABLE_INT("hw.alx.enable_msi", &alx_enable_msi);
+SYSCTL_INT(_hw_alx, OID_AUTO, enable_msi, CTLFLAG_RDTUN, &alx_enable_msi,
+    0, "Enable MSI interrupts");
 
 static void
 alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
@@ -395,12 +409,6 @@ static void
 alx_intr_enable(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
-#ifdef __notyet
-	int i;
-#endif
-
-	if (atomic_fetchadd_int(&sc->irq_sem, -1) != 1)
-		return;
 
 	hw = &sc->hw;
 
@@ -409,13 +417,12 @@ alx_intr_enable(struct alx_softc *sc)
 	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
 	ALX_MEM_FLUSH(hw);
 
-	if (!ALX_FLAG(sc, USING_MSIX))
-		return;
-
 #ifdef __notyet
+	int i;
 	/* enable all individual MSIX IRQs */
-	for (i = 0; i < adpt->nr_vec; i++)
-		alx_mask_msix(hw, i, false);
+	if (ALX_FLAG(sc, USING_MSIX))
+		for (i = 0; i < adpt->nr_vec; i++)
+			alx_mask_msix(hw, i, false);
 #endif
 }
 
@@ -423,17 +430,17 @@ static void
 alx_intr_disable(struct alx_softc *sc)
 {
 	struct alx_hw *hw = &sc->hw;
-	int i;
-
-	atomic_add_int(&sc->irq_sem, 1);
 
 	ALX_MEM_W32(hw, ALX_ISR, ALX_ISR_DIS);
 	ALX_MEM_W32(hw, ALX_IMR, 0);
 	ALX_MEM_FLUSH(hw);
 
+#ifdef __notyet
+	int i;
 	if (ALX_FLAG(sc, USING_MSIX))
 		for (i = 0; i < sc->nr_vec; i++)
 			alx_mask_msix(hw, i, true);
+#endif
 }
 
 static int
@@ -539,8 +546,7 @@ alx_init_sw(struct alx_softc *sc)
 	    FIELDX(ALX_MAC_CTRL_PRMBLEN, 7);
 	hw->is_fpga = false;
 
-	sc->irq_sem = 1;
-	ALX_FLAG_SET(sc, HALT);
+	sc->irq_sem = 0;
 
 	return err;
 }
@@ -825,7 +831,7 @@ alx_link_task(void *arg, int pending __unused)
 }
 
 static int
-alx_irq_legacy(void *arg)
+alx_intr_legacy(void *arg)
 {
 	struct alx_softc *sc;
 	struct alx_hw *hw;
@@ -854,23 +860,68 @@ alx_irq_legacy(void *arg)
 }
 
 static int
-alx_allocate_legacy_irq(struct alx_softc *sc)
+alx_intr_msi(void *arg)
+{
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+	uint32_t intr;
+
+	sc = arg;
+	hw = &sc->hw;
+
+	ALX_MEM_R32(hw, ALX_ISR, &intr);
+
+	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
+
+	intr &= hw->imask;
+	if (intr & ALX_ISR_PHY) {
+		hw->imask &= ~ALX_ISR_PHY;
+		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
+		taskqueue_enqueue(taskqueue_swi, &sc->alx_link_task);
+	}
+
+	ALX_MEM_W32(hw, ALX_ISR, 0);
+
+	return (FILTER_HANDLED);
+}
+
+static int
+alx_alloc_intr(struct alx_softc *sc)
 {
 	device_t dev;
+	driver_filter_t *filter;
 	struct alx_hw *hw;
-	int rid, error;
+	uint32_t msi_ctrl;
+	int rid, error, nmsi;
 
 	dev = sc->alx_dev;
 	hw = &sc->hw;
+
+	rid = 0; /* For legacy INTx interrupts. */
+	filter = alx_intr_legacy;
+
+	if (alx_enable_msi) {
+		nmsi = 1;
+		msi_ctrl = FIELDX(ALX_MSI_RETRANS_TM, hw->imt >> 1);
+		if (pci_alloc_msi(dev, &nmsi) == 0 && nmsi == 1) {
+			rid = 1;
+			ALX_MEM_W32(hw, ALX_MSI_RETRANS_TIMER,
+			    msi_ctrl | ALX_MSI_MASK_SEL_LINE);
+			ALX_FLAG_SET(sc, USING_MSI);
+			filter = alx_intr_msi;
+		} else
+			device_printf(dev,
+		    "could not allocate MSI message, falling back to INTx\n");
+	}
+
+	if (!ALX_FLAG(sc, USING_MSIX) && !ALX_FLAG(sc, USING_MSI))
+		ALX_MEM_W32(hw, ALX_MSI_RETRANS_TIMER, 0);
 
 	sc->nr_txq = 1;
 	sc->nr_rxq = 1; // XXX needed?
 	sc->nr_vec = 1;
 	sc->nr_hwrxq = 1;
 
-	ALX_MEM_W32(hw, ALX_MSI_RETRANS_TIMER, 0);
-
-	rid = 0;
 	sc->alx_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
 	    RF_ACTIVE | RF_SHAREABLE);
 	if (sc->alx_irq == NULL) {
@@ -879,7 +930,7 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 	}
 
 	error = bus_setup_intr(dev, sc->alx_irq, INTR_TYPE_NET | INTR_MPSAFE,
-	    alx_irq_legacy, NULL, sc, &sc->alx_cookie);
+	    filter, NULL, sc, &sc->alx_cookie);
 	if (error != 0) {
 		device_printf(dev, "failed to register interrupt handler\n");
 		return (ENXIO);
@@ -900,7 +951,7 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 }
 
 static void
-alx_free_legacy_irq(struct alx_softc *sc)
+alx_free_intr(struct alx_softc *sc)
 {
 	device_t dev;
 
@@ -917,6 +968,9 @@ alx_free_legacy_irq(struct alx_softc *sc)
 
 	if (sc->alx_irq != NULL)
 		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->alx_irq);
+
+	if (ALX_FLAG(sc, USING_MSI))
+		pci_release_msi(dev);
 }
 
 static int
@@ -1053,7 +1107,7 @@ alx_init_locked(struct alx_softc *sc)
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
 
 	alx_configure_basic(hw);
-	alx_configure_rss(hw, 0 /* XXX */);
+	//alx_configure_rss(hw, 0 /* XXX */);
 	/*
 	 * XXX configure some VLAN rx strip thingy and some promiscuous mode
 	 * stuff and some multicast stuff.
@@ -1209,7 +1263,7 @@ alx_attach(device_t dev)
 	}
 	memcpy(&hw->mac_addr, &hw->perm_addr, ETHER_ADDR_LEN);
 
-	error = alx_allocate_legacy_irq(sc);
+	error = alx_alloc_intr(sc);
 	if (error != 0)
 		goto fail;
 
@@ -1275,8 +1329,6 @@ alx_detach(device_t dev)
 	sc = device_get_softc(dev);
 	hw = &sc->hw;
 
-	ALX_FLAG_SET(sc, HALT);
-
 	/* Restore permanent mac address. */
 	alx_set_macaddr(hw, hw->perm_addr);
 
@@ -1290,7 +1342,7 @@ alx_detach(device_t dev)
 		sc->alx_ifp = NULL;
 	}
 
-	alx_free_legacy_irq(sc);
+	alx_free_intr(sc);
 
 	if (sc->alx_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, PCIR_BAR(0),
