@@ -857,14 +857,18 @@ static int
 alx_allocate_legacy_irq(struct alx_softc *sc)
 {
 	device_t dev;
+	struct alx_hw *hw;
 	int rid, error;
 
 	dev = sc->alx_dev;
+	hw = &sc->hw;
 
 	sc->nr_txq = 1;
 	sc->nr_rxq = 1; // XXX needed?
 	sc->nr_vec = 1;
 	sc->nr_hwrxq = 1;
+
+	ALX_MEM_W32(hw, ALX_MSI_RETRANS_TIMER, 0);
 
 	rid = 0;
 	sc->alx_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
@@ -1157,10 +1161,6 @@ alx_attach(device_t dev)
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
 
-	error = alx_allocate_legacy_irq(sc);
-	if (error != 0)
-		goto fail;
-
 	error = pci_set_powerstate(dev, PCI_POWERSTATE_D0);
 	if (error != 0) {
 		device_printf(dev, "failed to set PCI power state to D0\n");
@@ -1208,6 +1208,10 @@ alx_attach(device_t dev)
 		goto fail;
 	}
 	memcpy(&hw->mac_addr, &hw->perm_addr, ETHER_ADDR_LEN);
+
+	error = alx_allocate_legacy_irq(sc);
+	if (error != 0)
+		goto fail;
 
 	if (!alx_get_phy_info(hw)) {
 		device_printf(dev, "failed to identify PHY\n");
