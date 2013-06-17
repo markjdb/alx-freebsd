@@ -80,6 +80,7 @@ static struct alx_dev {
 
 static int	alx_allocate_legacy_irq(struct alx_softc *);
 static int	alx_attach(device_t);
+static void	alx_check_link(struct alx_softc *);
 static int	alx_detach(device_t);
 static int	alx_dma_alloc(struct alx_softc *);
 static void	alx_dma_free(struct alx_softc *);
@@ -126,6 +127,25 @@ static driver_t alx_driver = {
 static devclass_t alx_devclass;
 
 DRIVER_MODULE(alx, pci, alx_driver, alx_devclass, 0, 0);
+
+void	check_for_pcie_error(struct alx_softc *, int);
+
+void
+check_for_pcie_error(struct alx_softc *sc, int id)
+{
+	int capreg, error;
+	uint32_t mask;
+
+	error = pci_find_cap(sc->alx_dev, PCIY_EXPRESS, &capreg);
+	if (error != 0) {
+		device_printf(sc->alx_dev, "error finding PCIe capability\n");
+		return;
+	}
+
+	mask = pci_read_config(sc->alx_dev, capreg + PCIER_DEVICE_STA, 2);
+
+	printf("%d: mask is 0x%x\n", id, mask & PCIEM_STA_CORRECTABLE_ERROR);
+}
 
 static void
 alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
@@ -602,6 +622,8 @@ alx_init_locked(struct alx_softc *sc)
 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
 	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
 
+	alx_check_link(sc);
+
 	ALX_MEM_W32(hw, ALX_ISR, (uint32_t)~ALX_ISR_DIS);
 	alx_intr_enable(sc);
 }
@@ -790,50 +812,41 @@ alx_int_task(void *context __unused, int pending __unused)
 {
 }
 
-static void
-alx_handle_link(void *arg, int pending __unused)
+static void __unused
+alx_check_link(struct alx_softc *sc)
 {
-	struct ifnet *ifp;
-	struct alx_softc *sc;
 	struct alx_hw *hw;
 	bool link_up, prev_link_up;
 	int error;
 	uint16_t speed, prev_speed;
 
-	sc = arg;
+	ALX_LOCK_ASSERT(sc);
+
 	hw = &sc->hw;
-	ifp = sc->alx_ifp;
 
-	printf("running alx_handle_link\n");
-
-	ALX_LOCK(sc);
-
-	alx_clear_phy_intr(hw);
+	printf("in alx_check_link\n");
 
 	error = alx_get_phy_link(hw, &link_up, &speed);
-	if (error != 0) {
-		printf("error from alx_get_phy_link\n");
-		goto done;
-	}
+	if (error != 0)
+		return;
 
-	printf("link_up: %d, speed: %d\n", link_up ? 1 : 0, speed);
-
-	hw->imask |= ALX_ISR_PHY;
-	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
+	printf("link is %d, speed is %d\n", link_up ? 1 : 0, speed);
 
 	if ((!link_up && !hw->link_up) ||
-	    (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
-		goto done;
+	    (sc->alx_ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+		return;
 
 	printf("setting the vars\n");
 
 	prev_speed = hw->link_speed + hw->link_duplex;
 	prev_link_up = hw->link_up;
 
+	check_for_pcie_error(sc, 3);
+
 	hw->link_up = link_up;
 	if (link_up) {
 		if (prev_link_up && prev_speed == speed)
-			goto done;
+			return;
 
 		hw->link_duplex = speed % 10;
 		hw->link_speed = speed - hw->link_duplex;
@@ -844,7 +857,7 @@ alx_handle_link(void *arg, int pending __unused)
 		alx_enable_aspm(hw, ALX_CAP(hw, L0S), ALX_CAP(hw, L1));
 		alx_start_mac(hw);
 
-		if_link_state_change(ifp, LINK_STATE_UP);
+		if_link_state_change(sc->alx_ifp, LINK_STATE_UP);
 	} else {
 		hw->link_duplex = 0;
 		hw->link_speed = 0;
@@ -854,7 +867,7 @@ alx_handle_link(void *arg, int pending __unused)
 		error = alx_reset_mac(hw);
 		if (error != 0) {
 			device_printf(sc->alx_dev, "failed to reset MAC\n");
-			goto done;
+			return;
 		}
 
 		alx_intr_disable(sc);
@@ -865,10 +878,34 @@ alx_handle_link(void *arg, int pending __unused)
 		alx_post_phy_link(hw, 0, ALX_CAP(hw, AZ));
 		alx_intr_enable(sc);
 
-		if_link_state_change(ifp, LINK_STATE_DOWN);
+		if_link_state_change(sc->alx_ifp, LINK_STATE_DOWN);
 	}
+}
 
-done:
+static void
+alx_handle_link(void *arg, int pending __unused)
+{
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+
+	sc = arg;
+	hw = &sc->hw;
+
+	ALX_LOCK(sc);
+
+	alx_clear_phy_intr(hw);
+
+	check_for_pcie_error(sc, 1);
+
+	alx_check_link(sc);
+
+	check_for_pcie_error(sc, 2);
+
+	printf("setting mask\n");
+
+	hw->imask |= ALX_ISR_PHY;
+	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
+
 	ALX_UNLOCK(sc);
 }
 
@@ -882,11 +919,14 @@ alx_irq_legacy(void *arg)
 	sc = arg;
 	hw = &sc->hw;
 
+	check_for_pcie_error(sc, 4);
+
 	ALX_MEM_R32(hw, ALX_ISR, &intr);
 	printf("received legacy interrupt: 0x%x\n", intr);
 
 	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0) {
 		printf("received stray interrupt?\n");
+		check_for_pcie_error(sc, 5);
 		return (FILTER_STRAY);
 	}
 
@@ -896,10 +936,7 @@ alx_irq_legacy(void *arg)
 
 	if (intr & ALX_ISR_PHY) {
 		printf("handling PHY interrupt\n");
-		/* suppress PHY interrupt, because the source
-		 * is from PHY internal. only the internal status
-		 * is cleared, the interrupt status could be cleared.
-		 */
+
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
 		taskqueue_enqueue(taskqueue_fast, &sc->alx_link_task);
@@ -907,10 +944,11 @@ alx_irq_legacy(void *arg)
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
 
+	check_for_pcie_error(sc, 6);
 	return (FILTER_HANDLED);
 }
 
-int
+int __unused
 alx_allocate_legacy_irq(struct alx_softc *sc)
 {
 	device_t dev;
@@ -931,7 +969,7 @@ alx_allocate_legacy_irq(struct alx_softc *sc)
 		return (ENXIO);
 	}
 
-	error = bus_setup_intr(dev, sc->alx_irq, INTR_TYPE_NET,
+	error = bus_setup_intr(dev, sc->alx_irq, INTR_TYPE_NET | INTR_MPSAFE,
 	    alx_irq_legacy, NULL, sc, &sc->alx_cookie);
 	if (error != 0) {
 		device_printf(dev, "failed to register interrupt handler\n");
@@ -1075,15 +1113,13 @@ alx_attach(device_t dev)
 	struct alx_hw *hw;
 	struct ifnet *ifp;
 	bool phy_cfged;
-	int err, rid;
+	int error, rid;
 
 	sc = device_get_softc(dev);
 	sc->alx_dev = dev;
 
 	mtx_init(&sc->alx_mtx, device_get_nameunit(dev), MTX_NETWORK_LOCK,
 	    MTX_DEF);
-
-	pci_enable_busmaster(dev);
 
 	rid = PCIR_BAR(0);
 	sc->alx_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
@@ -1093,71 +1129,83 @@ alx_attach(device_t dev)
 		return (ENXIO);
 	}
 
+	check_for_pcie_error(sc, 7);
+
 	hw = &sc->hw;
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
 
-	err = alx_allocate_legacy_irq(sc);
-	if (err != 0)
+	error = alx_allocate_legacy_irq(sc);
+	if (error != 0)
 		goto fail;
 
-	err = alx_init_sw(sc);
-	if (err != 0) {
-		device_printf(dev, "failed to initialize device softc\n");
-		err = ENXIO;
+	error = pci_set_powerstate(dev, PCI_POWERSTATE_D0);
+	if (error != 0) {
+		device_printf(dev, "failed to set PCI power state to D0\n");
+		error = ENXIO;
 		goto fail;
 	}
 
-	err = alx_dma_alloc(sc);
-	if (err != 0) {
-		device_printf(dev, "cannot initialize DMA mappings\n");
-		err = ENXIO;
+	pci_enable_busmaster(dev);
+
+	error = alx_init_sw(sc);
+	if (error != 0) {
+		device_printf(dev, "failed to initialize device softc\n");
+		error = ENXIO;
 		goto fail;
 	}
 
 	alx_reset_pcie(hw);
 
 	phy_cfged = alx_phy_configed(hw);
-
 	if (!phy_cfged)
 		alx_reset_phy(hw, !hw->hib_patch);
 
-	err = alx_reset_mac(hw);
-	if (err) {
-		device_printf(dev, "MAC reset failed with error %d\n", err);
-		err = ENXIO;
+	error = alx_reset_mac(hw);
+	if (error) {
+		device_printf(dev, "MAC reset failed with error %d\n", error);
+		error = ENXIO;
 		goto fail;
 	}
 
+	check_for_pcie_error(sc, 0);
+
 	if (!phy_cfged) {
-		err = alx_setup_speed_duplex(hw, hw->adv_cfg, hw->flowctrl);
-		if (err) {
+		error = alx_setup_speed_duplex(hw, hw->adv_cfg, hw->flowctrl);
+		if (error) {
 			device_printf(dev,
-			    "failed to configure PHY with error %d\n", err);
-			err = ENXIO;
+			    "failed to configure PHY with error %d\n", error);
+			error = ENXIO;
 			goto fail;
 		}
 	}
 
-	err = alx_get_perm_macaddr(hw, hw->perm_addr);
-	if (err != 0) {
+	error = alx_get_perm_macaddr(hw, hw->perm_addr);
+	if (error != 0) {
 		/* XXX Generate a random MAC address instead? */
 		device_printf(dev, "could not retrieve MAC address\n");
-		err = ENXIO;
+		error = ENXIO;
 		goto fail;
 	}
 	memcpy(&hw->mac_addr, &hw->perm_addr, ETHER_ADDR_LEN);
 
 	if (!alx_get_phy_info(hw)) {
 		device_printf(dev, "failed to identify PHY\n");
-		err = ENXIO;
+		error = ENXIO;
+		goto fail;
+	}
+
+	error = alx_dma_alloc(sc);
+	if (error != 0) {
+		device_printf(dev, "cannot initialize DMA mappings\n");
+		error = ENXIO;
 		goto fail;
 	}
 
 	sc->alx_ifp = if_alloc(IFT_ETHER);
 	if (sc->alx_ifp == NULL) {
 		device_printf(dev, "failed to allocate an ifnet\n");
-		err = ENOSPC;
+		error = ENOSPC;
 		goto fail;
 	}
 
@@ -1188,10 +1236,10 @@ alx_attach(device_t dev)
 	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
 
 fail:
-	if (err != 0)
+	if (error != 0)
 		alx_detach(dev);
 
-	return (err);
+	return (error);
 }
 
 static int
@@ -1242,6 +1290,15 @@ alx_detach(device_t dev)
 static int
 alx_shutdown(device_t dev)
 {
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+
+	sc = device_get_softc(dev);
+	hw = &sc->hw;
+
+	alx_stop(sc);
+
+	alx_clear_phy_intr(hw);
 
 	return (0);
 }
