@@ -128,25 +128,6 @@ static devclass_t alx_devclass;
 
 DRIVER_MODULE(alx, pci, alx_driver, alx_devclass, 0, 0);
 
-void	check_for_pcie_error(struct alx_softc *, int);
-
-void
-check_for_pcie_error(struct alx_softc *sc, int id)
-{
-	int capreg, error;
-	uint32_t mask;
-
-	error = pci_find_cap(sc->alx_dev, PCIY_EXPRESS, &capreg);
-	if (error != 0) {
-		device_printf(sc->alx_dev, "error finding PCIe capability\n");
-		return;
-	}
-
-	mask = pci_read_config(sc->alx_dev, capreg + PCIER_DEVICE_STA, 2);
-
-	printf("%d: mask is 0x%x\n", id, mask & PCIEM_STA_CORRECTABLE_ERROR);
-}
-
 static void
 alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 {
@@ -319,7 +300,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
-	    65535 + sizeof(struct ether_vlan_header), /* maxsize */
+	    PAGE_SIZE,				/* maxsize */
 	    1,					/* nsegments */
 	    PAGE_SIZE,				/* maxsegsize */
 	    0,					/* flags */
@@ -331,6 +312,7 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
+	/* Allocate space for the TX buffer ring. */
 	sc->alx_tx_queue.bf_info = malloc(
 	    sc->tx_ringsz * sizeof(struct alx_buffer), M_DEVBUF,
 	    M_NOWAIT | M_ZERO);
@@ -341,12 +323,54 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
-	/* Create DMA maps for TX buffers. */
+	/* Create DMA maps for the TX buffers. */
 	buf = sc->alx_tx_queue.bf_info;
 	for (i = 0; i < sc->tx_ringsz; i++, buf++) {
 		error = bus_dmamap_create(sc->alx_tx_buf_tag, 0, &buf->dmamap);
 		if (error != 0) {
-			device_printf(dev, "coult not create TX DMA map\n");
+			device_printf(dev, "could not create TX DMA map\n");
+			/* XXX cleanup */
+			return (error);
+		}
+	}
+
+	/* Create the DMA tag for the receive buffers. */
+	error = bus_dma_tag_create(
+	    sc->alx_parent_tag,			/* parent */
+	    8, 0,				/* alignment, boundary */
+	    BUS_SPACE_MAXADDR,			/* lowaddr */
+	    BUS_SPACE_MAXADDR,			/* highaddr */
+	    NULL, NULL,				/* filter, filterarg */
+	    9 * 1024,				/* maxsize */
+	    1,					/* nsegments */
+	    9 * 1024,				/* maxsegsize */
+	    0,					/* flags */
+	    NULL, NULL,				/* lockfunc, lockarg */
+	    &sc->alx_rx_buf_tag);
+	if (error != 0) {
+		device_printf(dev, "could not create RX buffer DMA tag\n");
+		/* XXX cleanup */
+		return (error);
+	}
+
+	/* Allocate space for the RX buffer ring. */
+	/* XXX does this need to be M_NOWAIT? */
+	sc->alx_rx_queue.bf_info = malloc(
+	    sc->rx_ringsz * sizeof(struct alx_buffer), M_DEVBUF,
+	    M_NOWAIT | M_ZERO);
+	if (sc->alx_rx_queue.bf_info == NULL) {
+		device_printf(dev,
+		    "could not allocate memory for RX buffer ring\n");
+		/* XXX cleanup */
+		return (error);
+	}
+
+	/* Create DMA maps for the RX buffers. */
+	buf = sc->alx_rx_queue.bf_info;
+	for (i = 0; i < sc->rx_ringsz; i++, buf++) {
+		error = bus_dmamap_create(sc->alx_rx_buf_tag, 0, &buf->dmamap);
+		if (error != 0) {
+			device_printf(dev, "could not create RX DMA map\n");
 			/* XXX cleanup */
 			return (error);
 		}
@@ -489,7 +513,7 @@ alx_init_sw(struct alx_softc *sc)
 	sc->rx_ringsz = 512;
 	hw->sleep_ctrl = ALX_SLEEP_WOL_MAGIC | ALX_SLEEP_WOL_PHY;
 	hw->imt = 200;
-	hw->imask = ALX_ISR_MISC | ALX_ISR_PHY;
+	hw->imask = ALX_ISR_MISC;
 	hw->dma_chnl = hw->max_dma_chnl;
 	hw->ith_tpd = sc->tx_ringsz / 3;
 	hw->link_up = false;
@@ -519,6 +543,8 @@ static void
 alx_init_rx_ring(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
+	struct alx_buffer *rx_buf;
+	int i;
 
 	ALX_LOCK_ASSERT(sc);
 
@@ -531,12 +557,20 @@ alx_init_rx_ring(struct alx_softc *sc)
 	sc->alx_rx_queue.qidx = 0;
 	sc->alx_rx_queue.count = sc->rx_ringsz;
 
+	hw->imask |= ALX_ISR_RX_Q0;
+
+	/* XXX I guess the RFD and RRD rings must come from the same block? */
 	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma & 0xffffffff);
 	ALX_MEM_W32(hw, ALX_RRD_ADDR_LO, sc->alx_rx_queue.rrd_dma & 0xffffffff);
 	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, sc->alx_rx_queue.rfd_dma >> 32);
 	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
 	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
 	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
+
+	for (i = 0; i < sc->rx_ringsz; i++) {
+		rx_buf = &sc->alx_rx_queue.bf_info[i];
+		rx_buf->m = NULL;
+	}
 }
 
 static void
@@ -590,8 +624,6 @@ alx_init_locked(struct alx_softc *sc)
 
 	ALX_LOCK_ASSERT(sc);
 
-	printf("in alx_init_locked\n");
-
 	ifp = sc->alx_ifp;
 	hw = &sc->hw;
 
@@ -644,13 +676,10 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 	M_ASSERTPKTHDR(*m_head);
 
 	ALX_MEM_R16(&sc->hw, sc->alx_tx_queue.c_reg, &cidx);
-	printf("cidx is %u\n", cidx);
 
 	desci = sc->alx_tx_queue.pidx;
 	tx_buf = tx_buf_mapped = &sc->alx_tx_queue.bf_info[desci];
 	map = tx_buf->dmamap;
-
-	printf("using descriptor %d\n", desci);
 
 	/* XXX figure out how segments the DMA engine can support. */
 retry:
@@ -685,8 +714,6 @@ retry:
 		bus_dmamap_unload(sc->alx_tx_tag, map);
 		return (ENOBUFS);
 	}
-
-	printf("nsegs is %d\n", nsegs);
 
 	for (i = 0; i < nsegs; i++, desci = ALX_TX_INC(desci, sc)) {
 		td = &sc->alx_tx_queue.tpd_hdr[desci];
@@ -745,9 +772,7 @@ alx_start_locked(struct ifnet *ifp)
 	ALX_LOCK_ASSERT(sc);
 
 	if ((ifp->if_drv_flags & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
-	    IFF_DRV_RUNNING)
-		return;
-	if (!sc->hw.link_up)
+	    IFF_DRV_RUNNING || !sc->hw.link_up)
 		return;
 
 	while (!IFQ_DRV_IS_EMPTY(&ifp->if_snd)) {
@@ -774,8 +799,6 @@ alx_stop(struct alx_softc *sc)
 	struct ifnet *ifp;
 
 	ALX_LOCK_ASSERT(sc);
-
-	printf("in alx_stop\n");
 
 	ifp = sc->alx_ifp;
 	ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
@@ -808,8 +831,12 @@ alx_reset(struct alx_softc *sc)
 }
 
 static void
-alx_int_task(void *context __unused, int pending __unused)
+alx_int_task(void *context, int pending __unused)
 {
+	struct alx_softc *sc;
+
+	sc = context;
+	//alx_intr_enable(sc);
 }
 
 static void __unused
@@ -824,24 +851,16 @@ alx_check_link(struct alx_softc *sc)
 
 	hw = &sc->hw;
 
-	printf("in alx_check_link\n");
-
 	error = alx_get_phy_link(hw, &link_up, &speed);
 	if (error != 0)
 		return;
-
-	printf("link is %d, speed is %d\n", link_up ? 1 : 0, speed);
 
 	if ((!link_up && !hw->link_up) ||
 	    (sc->alx_ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
 		return;
 
-	printf("setting the vars\n");
-
 	prev_speed = hw->link_speed + hw->link_duplex;
 	prev_link_up = hw->link_up;
-
-	check_for_pcie_error(sc, 3);
 
 	hw->link_up = link_up;
 	if (link_up) {
@@ -851,8 +870,6 @@ alx_check_link(struct alx_softc *sc)
 		hw->link_duplex = speed % 10;
 		hw->link_speed = speed - hw->link_duplex;
 
-		printf("link is up\n");
-
 		alx_post_phy_link(hw, hw->link_speed, ALX_CAP(hw, AZ));
 		alx_enable_aspm(hw, ALX_CAP(hw, L0S), ALX_CAP(hw, L1));
 		alx_start_mac(hw);
@@ -861,8 +878,6 @@ alx_check_link(struct alx_softc *sc)
 	} else {
 		hw->link_duplex = 0;
 		hw->link_speed = 0;
-
-		printf("link is not up\n");
 
 		error = alx_reset_mac(hw);
 		if (error != 0) {
@@ -895,16 +910,10 @@ alx_handle_link(void *arg, int pending __unused)
 
 	alx_clear_phy_intr(hw);
 
-	check_for_pcie_error(sc, 1);
-
-	alx_check_link(sc);
-
-	check_for_pcie_error(sc, 2);
-
-	printf("setting mask\n");
-
 	hw->imask |= ALX_ISR_PHY;
 	ALX_MEM_W32(hw, ALX_IMR, hw->imask);
+
+	alx_check_link(sc);
 
 	ALX_UNLOCK(sc);
 }
@@ -919,24 +928,15 @@ alx_irq_legacy(void *arg)
 	sc = arg;
 	hw = &sc->hw;
 
-	check_for_pcie_error(sc, 4);
-
 	ALX_MEM_R32(hw, ALX_ISR, &intr);
-	printf("received legacy interrupt: 0x%x\n", intr);
-
-	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0) {
-		printf("received stray interrupt?\n");
-		check_for_pcie_error(sc, 5);
+	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
 		return (FILTER_STRAY);
-	}
 
-	/* Acknowledge the interrupt. */
+	/* Acknowledge and disable interrupts. */
 	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
+
 	intr &= hw->imask;
-
 	if (intr & ALX_ISR_PHY) {
-		printf("handling PHY interrupt\n");
-
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
 		taskqueue_enqueue(taskqueue_fast, &sc->alx_link_task);
@@ -944,7 +944,6 @@ alx_irq_legacy(void *arg)
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
 
-	check_for_pcie_error(sc, 6);
 	return (FILTER_HANDLED);
 }
 
@@ -1129,8 +1128,6 @@ alx_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	check_for_pcie_error(sc, 7);
-
 	hw = &sc->hw;
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
@@ -1167,8 +1164,6 @@ alx_attach(device_t dev)
 		error = ENXIO;
 		goto fail;
 	}
-
-	check_for_pcie_error(sc, 0);
 
 	if (!phy_cfged) {
 		error = alx_setup_speed_duplex(hw, hw->adv_cfg, hw->flowctrl);
@@ -1227,7 +1222,7 @@ alx_attach(device_t dev)
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_10_T | IFM_FDX, 0, NULL);
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX, 0, NULL);
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
-	if (pci_get_device(dev) & 1) {
+	if (ALX_CAP(hw, GIGA)) {
 		/* GigE-capable chipsets have an odd device ID. */
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T, 0, NULL);
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0,
@@ -1252,14 +1247,13 @@ alx_detach(device_t dev)
 	hw = &sc->hw;
 
 	ALX_FLAG_SET(sc, HALT);
-	if (device_is_attached(dev)) {
-	}
 
 	/* Restore permanent mac address. */
 	alx_set_macaddr(hw, hw->perm_addr);
 
-	bus_generic_detach(dev);
 	/* XXX Free DMA */
+	free(sc->alx_tx_queue.bf_info, M_DEVBUF);
+	free(sc->alx_rx_queue.bf_info, M_DEVBUF);
 
 	if (sc->alx_ifp != NULL) {
 		ether_ifdetach(sc->alx_ifp);
@@ -1282,6 +1276,8 @@ alx_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY, PCIR_BAR(0),
 		    sc->alx_res);
 
+	bus_generic_detach(dev);
+
 	mtx_destroy(&sc->alx_mtx);
 
 	return (0);
@@ -1300,7 +1296,7 @@ alx_shutdown(device_t dev)
 
 	alx_clear_phy_intr(hw);
 
-	return (0);
+	return (bus_generic_suspend(dev));
 }
 
 static int

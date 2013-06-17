@@ -183,7 +183,7 @@ struct alx_softc {
 	bus_dmamap_t		 alx_tx_dmamap;
 
         bus_dma_tag_t            alx_tx_buf_tag;
-        bus_dmamap_t             alx_tx_buf_dmamap; /* XXX do we need this? */
+	bus_dma_tag_t		 alx_rx_buf_tag;
 
 	bus_dma_tag_t		 alx_rx_tag;
 	bus_dmamap_t		 alx_rx_dmamap;
