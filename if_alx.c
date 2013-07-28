@@ -113,6 +113,8 @@ static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 
 static void	alx_init_rx_ring(struct alx_softc *);
 static void	alx_init_tx_ring(struct alx_softc *);
+static void	alx_rx_intr(struct alx_softc *);
+static int	alx_rx_newbuf(struct alx_softc *, int);
 static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
 static device_method_t alx_methods[] = {
@@ -361,9 +363,9 @@ alx_dma_alloc(struct alx_softc *sc)
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
-	    9 * 1024,				/* maxsize */
+	    MCLBYTES,				/* maxsize */
 	    1,					/* nsegments */
-	    9 * 1024,				/* maxsegsize */
+	    MCLBYTES,				/* maxsegsize */
 	    0,					/* flags */
 	    NULL, NULL,				/* lockfunc, lockarg */
 	    &sc->alx_rx_buf_tag);
@@ -556,7 +558,7 @@ alx_init_rx_ring(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
 	struct alx_buffer *rx_buf;
-	int i;
+	int i, error;
 
 	ALX_LOCK_ASSERT(sc);
 
@@ -565,11 +567,24 @@ alx_init_rx_ring(struct alx_softc *sc)
 	sc->alx_rx_queue.pidx = 0;
 	sc->alx_rx_queue.p_reg = ALX_RFD_PIDX;
 	sc->alx_rx_queue.cidx = 0;
+	sc->alx_rx_queue.rrd_cidx = 0;
 	sc->alx_rx_queue.c_reg = ALX_RFD_CIDX;
 	sc->alx_rx_queue.qidx = 0;
 	sc->alx_rx_queue.count = sc->rx_ringsz;
 
 	hw->imask |= ALX_ISR_RX_Q0;
+
+	/* XXX multiple queues. */
+	for (i = 0; i < sc->rx_ringsz; i++) {
+		rx_buf = &sc->alx_rx_queue.bf_info[i];
+		rx_buf->m = NULL;
+		error = alx_rx_newbuf(sc, i);
+		if (error != 0) {
+			/* XXX this needs to be handled better. */
+			device_printf(sc->alx_dev, "failed to refresh mbufs\n");
+			break;
+		}
+	}
 
 	/* XXX I guess the RFD and RRD rings must come from the same block? */
 	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma & 0xffffffff);
@@ -578,11 +593,6 @@ alx_init_rx_ring(struct alx_softc *sc)
 	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
 	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
 	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
-
-	for (i = 0; i < sc->rx_ringsz; i++) {
-		rx_buf = &sc->alx_rx_queue.bf_info[i];
-		rx_buf->m = NULL;
-	}
 }
 
 static void
@@ -605,16 +615,91 @@ alx_init_tx_ring(struct alx_softc *sc)
 
 	hw->imask |= ALX_ISR_TX_Q0;
 
-	/* XXX multiple queues */
-	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma & 0xffffffff);
-	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
-	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
-
-	/* XXX iterate over buffer ring and reset everything. */
 	for (i = 0; i < sc->tx_ringsz; i++) {
 		tx_buf = &sc->alx_tx_queue.bf_info[i];
 		tx_buf->m = NULL;
 	}
+
+	/* XXX multiple queues */
+	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma & 0xffffffff);
+	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
+}
+
+static void
+alx_rx_intr(struct alx_softc *sc)
+{
+	struct mbuf *m;
+	struct ifnet *ifp;
+	struct alx_buffer *rx_buf;
+	struct rrd_desc *rrd;
+	int rrd_cidx, rrd_pidx, rfd_cidx, i;
+
+	ALX_LOCK_ASSERT(sc);
+
+	ifp = sc->alx_ifp;
+	rrd_cidx = sc->alx_rx_queue.cidx;
+	rrd_pidx = sc->alx_rx_queue.pidx;
+
+	for (i = 0; rrd_cidx != rrd_pidx; i++) {
+		rrd_cidx = sc->alx_rx_queue.cidx;
+		rrd = &sc->alx_rx_queue.rrd_hdr[rrd_cidx];
+		if (!(rrd->word3 & (1 << RRD_UPDATED_SHIFT)))
+			break;
+		rrd->word3 &= ~(1 << RRD_UPDATED_SHIFT);
+
+		/* Get the index of the corresponding RFD. */
+		rfd_cidx = FIELD_GETX(rrd->word0, RRD_SI);
+		if (rfd_cidx != sc->alx_rx_queue.cidx ||
+		    FIELD_GETX(rrd->word0, RRD_NOR) != 1) {
+			device_printf(sc->alx_dev,
+			    "RX consumer index mismatch\n");
+			/* XXX reset the chip? */
+			return;
+		}
+
+		rx_buf = &sc->alx_rx_queue.bf_info[rfd_cidx];
+		m = rx_buf->m;
+		rx_buf->m = NULL;
+
+		m->m_flags |= M_PKTHDR;
+		m->m_len = FIELD_GETX(rrd->word3, RRD_PKTLEN) - ETHER_CRC_LEN;
+		m->m_pkthdr.len = m->m_len;
+		m->m_pkthdr.rcvif = ifp;
+
+		/* Pass the packet up the stack. */
+		ALX_UNLOCK(sc);
+		(*ifp->if_input)(ifp, m);
+		ALX_LOCK(sc);
+	}
+}
+
+static int
+alx_rx_newbuf(struct alx_softc *sc, int index)
+{
+	struct mbuf *m;
+	bus_dma_segment_t seg;
+	struct alx_buffer *rx_buf;
+	struct rfd_desc *rfd;
+	int nsegs;
+
+	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
+	if (m == NULL)
+		return (ENOBUFS);
+	m->m_len = m->m_pkthdr.len = MCLBYTES;
+
+	rx_buf = &sc->alx_rx_queue.bf_info[index];
+	rx_buf->m = m;
+	if (bus_dmamap_load_mbuf_sg(sc->alx_rx_buf_tag, rx_buf->dmamap, m, &seg,
+	    &nsegs, 0) != 0) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+
+	rfd = &sc->alx_rx_queue.rfd_hdr[index];
+	rfd->addr = htole64(seg.ds_addr);
+
+	return (0);
 }
 
 static int
@@ -710,15 +795,44 @@ static void
 alx_stop(struct alx_softc *sc)
 {
 	struct ifnet *ifp;
+	struct alx_hw *hw;
+	struct alx_buffer *tx_buf, *rx_buf;
+	int i, error;
 
 	ALX_LOCK_ASSERT(sc);
 
+	hw = &sc->hw;
 	ifp = sc->alx_ifp;
 	ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
 
 	alx_intr_disable(sc);
 
+	error = alx_stop_mac(hw);
+	if (error != 0)
+		device_printf(sc->alx_dev, "error stopping MAC\n");
+
 	/* XXX what else? */
+	for (i = 0; i < sc->tx_ringsz; i++) {
+		tx_buf = &sc->alx_tx_queue.bf_info[i];
+		if (tx_buf->m != NULL) {
+			bus_dmamap_sync(sc->alx_tx_buf_tag, tx_buf->dmamap,
+			    BUS_DMASYNC_POSTWRITE);
+			bus_dmamap_unload(sc->alx_tx_buf_tag, tx_buf->dmamap);
+			m_freem(tx_buf->m);
+			tx_buf->m = NULL;
+		}
+	}
+
+	for (i = 0; i < sc->rx_ringsz; i++) {
+		rx_buf = &sc->alx_rx_queue.bf_info[i];
+		if (rx_buf->m != NULL) {
+			bus_dmamap_sync(sc->alx_rx_buf_tag, rx_buf->dmamap,
+			    BUS_DMASYNC_POSTWRITE);
+			bus_dmamap_unload(sc->alx_rx_buf_tag, rx_buf->dmamap);
+			m_freem(rx_buf->m);
+			rx_buf->m = NULL;
+		}
+	}
 }
 
 static void
@@ -807,6 +921,8 @@ alx_int_task(void *context, int pending __unused)
 	struct alx_softc *sc;
 
 	sc = context;
+
+	alx_rx_intr(sc);
 }
 
 static void
@@ -1106,8 +1222,6 @@ alx_init_locked(struct alx_softc *sc)
 	/* Load the DMA pointers. */
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
 
-	alx_configure_basic(hw);
-	//alx_configure_rss(hw, 0 /* XXX */);
 	/*
 	 * XXX configure some VLAN rx strip thingy and some promiscuous mode
 	 * stuff and some multicast stuff.
@@ -1135,6 +1249,9 @@ alx_start(struct ifnet *ifp)
 	ALX_UNLOCK(sc);
 }
 
+/*
+ * Transmit all of the frames in our send queue.
+ */
 static void
 alx_start_locked(struct ifnet *ifp)
 {
@@ -1263,6 +1380,8 @@ alx_attach(device_t dev)
 	}
 	memcpy(&hw->mac_addr, &hw->perm_addr, ETHER_ADDR_LEN);
 
+	alx_configure_basic(hw);
+
 	error = alx_alloc_intr(sc);
 	if (error != 0)
 		goto fail;
@@ -1306,7 +1425,6 @@ alx_attach(device_t dev)
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX, 0, NULL);
 	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
 	if (ALX_CAP(hw, GIGA)) {
-		/* GigE-capable chipsets have an odd device ID. */
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T, 0, NULL);
 		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0,
 		    NULL);
@@ -1358,24 +1476,25 @@ alx_detach(device_t dev)
 static int
 alx_shutdown(device_t dev)
 {
+
+	return (alx_suspend(dev));
+}
+
+static int
+alx_suspend(device_t dev)
+{
 	struct alx_softc *sc;
 	struct alx_hw *hw;
 
 	sc = device_get_softc(dev);
 	hw = &sc->hw;
 
+	ALX_LOCK(sc);
 	alx_stop(sc);
-
 	alx_clear_phy_intr(hw);
+	ALX_UNLOCK(sc);
 
 	return (bus_generic_suspend(dev));
-}
-
-static int
-alx_suspend(device_t dev)
-{
-
-	return (0);
 }
 
 static int
