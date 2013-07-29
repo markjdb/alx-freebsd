@@ -1260,13 +1260,11 @@ alx_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 	case SIOCGIFMEDIA:
 	case SIOCSIFMEDIA:
-#if 0
 		if (sc->alx_miibus == NULL)
 			return (EINVAL);
 		mii = device_get_softc(sc->alx_miibus);
 		error = ifmedia_ioctl(ifp, ifr, &mii->mii_media, cmd);
 		break;
-#endif
 	default:
 		error = ether_ioctl(ifp, cmd, data);
 		break;
