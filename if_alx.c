@@ -1500,9 +1500,6 @@ alx_attach(device_t dev)
 
 	sc->alx_phyaddr = 0;
 
-	uint32_t val = alx_miibus_readreg(sc->alx_dev, 0, MII_BMCR);
-	printf("BMCR before attach is 0x%x\n", val);
-
 	error = mii_attach(dev, &sc->alx_miibus, ifp, alx_mediachange,
 	    alx_mediastatus, BMSR_DEFCAPMASK, sc->alx_phyaddr, MII_OFFSET_ANY,
 	    MIIF_DOPAUSE | MIIF_NOISOLATE);
@@ -1510,9 +1507,6 @@ alx_attach(device_t dev)
 		device_printf(dev, "failed to attach to PHY\n");
 		goto fail;
 	}
-
-	val = alx_miibus_readreg(sc->alx_dev, 0, MII_BMSR);
-	printf("val is 0x%x\n", val);
 
 	ether_ifattach(ifp, hw->mac_addr);
 
