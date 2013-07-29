@@ -164,8 +164,9 @@ struct alx_softc {
 	int			eth_diag_cnt;
 
 	/* FreeBSD stuff is below. */
-        device_t		 alx_dev;
-	struct ifmedia		 alx_media;
+	device_t		 alx_dev;
+	device_t		 alx_miibus;
+	int			 alx_phyaddr;
 
 	struct resource		*alx_res;
 	struct resource		*alx_irq;
@@ -175,14 +176,14 @@ struct alx_softc {
 
 	struct taskqueue	*alx_tq;
 	struct task		 alx_int_task;
-        struct task              alx_link_task;
+        struct task		 alx_link_task;
 
 	bus_dma_tag_t		 alx_parent_tag;
 
 	bus_dma_tag_t		 alx_tx_tag;
 	bus_dmamap_t		 alx_tx_dmamap;
 
-        bus_dma_tag_t            alx_tx_buf_tag;
+	bus_dma_tag_t		 alx_tx_buf_tag;
 	bus_dma_tag_t		 alx_rx_buf_tag;
 
 	bus_dma_tag_t		 alx_rx_tag;

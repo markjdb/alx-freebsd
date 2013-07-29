@@ -16,6 +16,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -45,24 +46,25 @@
 
 #include <netinet/in.h>
 
+#include <dev/mii/mii.h>
+#include <dev/mii/miivar.h>
+
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
 #include <machine/bus.h>
 
+/* XXX */
 #include "compat.h"
 #include "alx_hw.h"
 #include "if_alxreg.h"
 #include "if_alxvar.h"
 
+#include "miibus_if.h"
+
 MODULE_DEPEND(alx, pci, 1, 1, 1);
 MODULE_DEPEND(alx, ether, 1, 1, 1);
-
-#define DRV_MAJ		1
-#define DRV_MIN		2
-#define DRV_PATCH	3
-#define DRV_MODULE_VER	\
-	__stringify(DRV_MAJ) "." __stringify(DRV_MIN) "." __stringify(DRV_PATCH)
+MODULE_DEPEND(alx, miibus, 1, 1, 1);
 
 static struct alx_dev {
 	uint16_t	 alx_vendorid;
@@ -87,11 +89,15 @@ static int	alx_shutdown(device_t);
 static void	alx_stop(struct alx_softc *);
 static int	alx_suspend(device_t);
 
+static int	alx_miibus_readreg(device_t, int, int);
+static int	alx_miibus_writereg(device_t, int, int, int);
+static void	alx_miibus_statchg(device_t);
+
 static int	alx_ioctl(struct ifnet *, u_long, caddr_t);
 static void	alx_init(void *);
 static void	alx_init_locked(struct alx_softc *);
-static int	alx_media_change(struct ifnet *);
-static void	alx_media_status(struct ifnet *, struct ifmediareq *);
+static int	alx_mediachange(struct ifnet *);
+static void	alx_mediastatus(struct ifnet *, struct ifmediareq *);
 static void	alx_start(struct ifnet *);
 static void	alx_start_locked(struct ifnet *);
 
@@ -118,12 +124,18 @@ static int	alx_rx_newbuf(struct alx_softc *, int);
 static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
 static device_method_t alx_methods[] = {
+	/* Device interface. */
 	DEVMETHOD(device_probe,		alx_probe),
 	DEVMETHOD(device_attach,	alx_attach),
 	DEVMETHOD(device_detach,	alx_detach),
 	DEVMETHOD(device_shutdown,	alx_shutdown),
 	DEVMETHOD(device_suspend,	alx_suspend),
 	DEVMETHOD(device_resume,	alx_resume),
+
+	/* MII interface. */
+	DEVMETHOD(miibus_readreg,	alx_miibus_readreg),
+	DEVMETHOD(miibus_writereg,	alx_miibus_writereg),
+	DEVMETHOD(miibus_statchg,	alx_miibus_statchg),
 
 	DEVMETHOD_END
 };
@@ -137,18 +149,19 @@ static driver_t alx_driver = {
 static devclass_t alx_devclass;
 
 DRIVER_MODULE(alx, pci, alx_driver, alx_devclass, 0, 0);
+DRIVER_MODULE(miibus, alx, miibus_driver, miibus_devclass, 0, 0);
 
 static SYSCTL_NODE(_hw, OID_AUTO, alx, CTLFLAG_RD, 0, "alx driver settings");
-
-static int alx_enable_msix = 0;
-TUNABLE_INT("hw.alx.enable_msix", &alx_enable_msix);
-SYSCTL_INT(_hw_alx, OID_AUTO, enable_msix, CTLFLAG_RDTUN, &alx_enable_msix,
-    0, "Enable MSI-X interrupts");
 
 static int alx_enable_msi = 0;
 TUNABLE_INT("hw.alx.enable_msi", &alx_enable_msi);
 SYSCTL_INT(_hw_alx, OID_AUTO, enable_msi, CTLFLAG_RDTUN, &alx_enable_msi,
     0, "Enable MSI interrupts");
+
+static int alx_enable_msix = 0;
+TUNABLE_INT("hw.alx.enable_msix", &alx_enable_msix);
+SYSCTL_INT(_hw_alx, OID_AUTO, enable_msix, CTLFLAG_RDTUN, &alx_enable_msix,
+    0, "Enable MSI-X interrupts");
 
 static void
 alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
@@ -157,6 +170,94 @@ alx_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 	if (error != 0)
 		return;
 	*(bus_addr_t *)arg = segs[0].ds_addr;
+}
+
+static int
+alx_miibus_readreg(device_t dev, int phy, int reg)
+{
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+	uint32_t v, clk;
+	int i;
+
+	device_printf(dev, "called with phy %d, reg 0x%x\n", phy, reg);
+
+	sc = device_get_softc(dev);
+	hw = &sc->hw;
+
+	clk = sc->hw.link_up ? ALX_MDIO_CLK_SEL_25MD4 :
+	    ALX_MDIO_CLK_SEL_25MD128;
+
+	ALX_MEM_W32(hw, ALX_MDIO, ALX_MDIO_SPRES_PRMBL | ALX_MDIO_START |
+	    ((clk & ALX_MDIO_CLK_SEL_MASK) << ALX_MDIO_CLK_SEL_SHIFT) |
+	    ((reg & ALX_MDIO_REG_MASK) << ALX_MDIO_REG_SHIFT) |
+	    ALX_MDIO_OP_READ);
+	for (i = 0; i < ALX_MDIO_MAX_AC_TO; i++) {
+		ALX_MEM_R32(hw, ALX_MDIO, &v);
+		if (!(v & ALX_MDIO_BUSY))
+			break;
+		DELAY(10);
+	}
+
+	if (i == ALX_MDIO_MAX_AC_TO) {
+		device_printf(sc->alx_dev, "PHY read timeout of 0x%x\n", reg);
+		return (0);
+	}
+
+	printf("returning 0x%lx\n", ((v >> ALX_MDIO_DATA_SHIFT) & ALX_MDIO_DATA_MASK));
+
+	return ((v >> ALX_MDIO_DATA_SHIFT) & ALX_MDIO_DATA_MASK);
+}
+
+static int
+alx_miibus_writereg(device_t dev, int phy, int reg, int val)
+{
+	struct alx_softc *sc;
+	struct alx_hw *hw;
+	uint32_t v, clk;
+	int i;
+
+	sc = device_get_softc(dev);
+	hw = &sc->hw;
+
+	device_printf(dev, "writing 0x%x to register 0x%d on PHY %d\n", val, reg, phy);
+
+	clk = sc->hw.link_up ? ALX_MDIO_CLK_SEL_25MD4 :
+	    ALX_MDIO_CLK_SEL_25MD128;
+
+	ALX_MEM_W32(hw, ALX_MDIO, ALX_MDIO_SPRES_PRMBL | ALX_MDIO_START |
+	    ((clk & ALX_MDIO_CLK_SEL_MASK) << ALX_MDIO_CLK_SEL_SHIFT) |
+	    ((reg & ALX_MDIO_REG_MASK) << ALX_MDIO_REG_SHIFT) |
+	    ((val & ALX_MDIO_DATA_MASK) << ALX_MDIO_DATA_SHIFT));
+	for (i = 0; i < ALX_MDIO_MAX_AC_TO; i++) {
+		ALX_MEM_R32(hw, ALX_MDIO, &v);
+		if (!(v & ALX_MDIO_BUSY))
+			break;
+		DELAY(10);
+	}
+
+	if (i == ALX_MDIO_MAX_AC_TO)
+		device_printf(sc->alx_dev, "PHY write timeout of 0x%x\n", reg);
+
+	return (0);
+}
+
+static void
+alx_miibus_statchg(device_t dev)
+{
+	struct alx_softc *sc;
+	struct mii_data *mii;
+	struct ifnet *ifp;
+
+	sc = device_get_softc(dev);
+	mii = device_get_softc(sc->alx_miibus);
+	ifp = sc->alx_ifp;
+
+	if (mii == NULL || ifp == NULL ||
+	    (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+		return;
+
+	/* XXX */
 }
 
 /*
@@ -641,6 +742,11 @@ alx_rx_intr(struct alx_softc *sc)
 	rrd_cidx = sc->alx_rx_queue.cidx;
 	rrd_pidx = sc->alx_rx_queue.pidx;
 
+	bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+	bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+	    BUS_DMASYNC_POSTWRITE);
+
 	for (i = 0; rrd_cidx != rrd_pidx; i++) {
 		rrd_cidx = sc->alx_rx_queue.cidx;
 		rrd = &sc->alx_rx_queue.rrd_hdr[rrd_cidx];
@@ -1090,76 +1196,56 @@ alx_free_intr(struct alx_softc *sc)
 }
 
 static int
-alx_media_change(struct ifnet *ifp)
+alx_mediachange(struct ifnet *ifp)
 {
+	struct alx_softc *sc;
+	struct mii_data *mii;
+	struct mii_softc *miisc;
+	int error;
 
-	return (0);
+	sc = ifp->if_softc;
+	ALX_LOCK(sc);
+	mii = device_get_softc(sc->alx_miibus);
+	LIST_FOREACH(miisc, &mii->mii_phys, mii_list)
+	    PHY_RESET(miisc);
+	error = mii_mediachg(mii);
+	ALX_UNLOCK(sc);
+
+	return (error);
 }
 
 static void
-alx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
+alx_mediastatus(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
 	struct alx_softc *sc;
-	struct alx_hw *hw;
+	struct mii_data *mii;
 
 	sc = ifp->if_softc;
-	hw = &sc->hw;
-
 	ALX_LOCK(sc);
-
-	ifmr->ifm_status = IFM_AVALID;
-	ifmr->ifm_active = IFM_ETHER;
-
-	if (hw->link_up)
-		ifmr->ifm_status |= IFM_ACTIVE;
-	else {
+	if ((ifp->if_flags & IFF_UP) == 0) {
 		ALX_UNLOCK(sc);
 		return;
 	}
+	mii = device_get_softc(sc->alx_miibus);
 
-	switch (hw->link_duplex) {
-	case ALX_FULL_DUPLEX:
-		ifmr->ifm_active |= IFM_FDX;
-		break;
-	case ALX_HALF_DUPLEX:
-		ifmr->ifm_active |= IFM_HDX;
-		break;
-	default:
-		device_printf(sc->alx_dev, "invalid duplex mode %u\n",
-		    hw->link_duplex);
-		break;
-	}
-
-	switch (hw->link_speed) {
-	case SPEED_10:
-		ifmr->ifm_active |= IFM_10_T;
-		break;
-	case SPEED_100:
-		ifmr->ifm_active |= IFM_100_TX;
-		break;
-	case SPEED_1000:
-		ifmr->ifm_active |= IFM_1000_T;
-		break;
-	default:
-		device_printf(sc->alx_dev, "invalid link speed %u\n",
-		    hw->link_speed);
-		break;
-	}
-
+	mii_pollstat(mii);
+	ifmr->ifm_status = mii->mii_media_status;
+	ifmr->ifm_active = mii->mii_media_active;
 	ALX_UNLOCK(sc);
 }
 
 static int
-alx_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
+alx_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
 	struct alx_softc *sc;
+	struct mii_data *mii;
 	struct ifreq *ifr;
 	int error = 0;
 
 	sc = ifp->if_softc;
 	ifr = (struct ifreq *)data;
 
-	switch (command) {
+	switch (cmd) {
 	case SIOCSIFFLAGS:
 		ALX_LOCK(sc);
 		if ((ifp->if_flags & IFF_UP) &&
@@ -1173,10 +1259,16 @@ alx_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 		ALX_UNLOCK(sc);
 		break;
 	case SIOCGIFMEDIA:
-		error = ifmedia_ioctl(ifp, ifr, &sc->alx_media, command);
+	case SIOCSIFMEDIA:
+#if 0
+		if (sc->alx_miibus == NULL)
+			return (EINVAL);
+		mii = device_get_softc(sc->alx_miibus);
+		error = ifmedia_ioctl(ifp, ifr, &mii->mii_media, cmd);
 		break;
+#endif
 	default:
-		error = ether_ioctl(ifp, command, data);
+		error = ether_ioctl(ifp, cmd, data);
 		break;
 	}
 
@@ -1350,9 +1442,7 @@ alx_attach(device_t dev)
 
 	alx_reset_pcie(hw);
 
-	phy_cfged = alx_phy_configed(hw);
-	if (!phy_cfged)
-		alx_reset_phy(hw, !hw->hib_patch);
+	alx_reset_phy(hw, !hw->hib_patch);
 
 	error = alx_reset_mac(hw);
 	if (error) {
@@ -1361,19 +1451,16 @@ alx_attach(device_t dev)
 		goto fail;
 	}
 
-	if (!phy_cfged) {
-		error = alx_setup_speed_duplex(hw, hw->adv_cfg, hw->flowctrl);
-		if (error) {
-			device_printf(dev,
-			    "failed to configure PHY with error %d\n", error);
-			error = ENXIO;
-			goto fail;
-		}
+	/* XXX this should be done in a PHY driver */
+	error = alx_setup_speed_duplex(hw, hw->adv_cfg, hw->flowctrl);
+	if (error != 0) {
+		device_printf(dev, "could not set PHY parameters\n");
+		error = ENXIO;
+		goto fail;
 	}
 
 	error = alx_get_perm_macaddr(hw, hw->perm_addr);
 	if (error != 0) {
-		/* XXX Generate a random MAC address instead? */
 		device_printf(dev, "could not retrieve MAC address\n");
 		error = ENXIO;
 		goto fail;
@@ -1381,10 +1468,6 @@ alx_attach(device_t dev)
 	memcpy(&hw->mac_addr, &hw->perm_addr, ETHER_ADDR_LEN);
 
 	alx_configure_basic(hw);
-
-	error = alx_alloc_intr(sc);
-	if (error != 0)
-		goto fail;
 
 	if (!alx_get_phy_info(hw)) {
 		device_printf(dev, "failed to identify PHY\n");
@@ -1415,21 +1498,27 @@ alx_attach(device_t dev)
 	ifp->if_start = alx_start;
 	ifp->if_init = alx_init;
 
+	sc->alx_phyaddr = 0;
+
+	uint32_t val = alx_miibus_readreg(sc->alx_dev, 0, MII_BMCR);
+	printf("BMCR before attach is 0x%x\n", val);
+
+	error = mii_attach(dev, &sc->alx_miibus, ifp, alx_mediachange,
+	    alx_mediastatus, BMSR_DEFCAPMASK, sc->alx_phyaddr, MII_OFFSET_ANY,
+	    MIIF_DOPAUSE | MIIF_NOISOLATE);
+	if (error != 0) {
+		device_printf(dev, "failed to attach to PHY\n");
+		goto fail;
+	}
+
+	val = alx_miibus_readreg(sc->alx_dev, 0, MII_BMSR);
+	printf("val is 0x%x\n", val);
+
 	ether_ifattach(ifp, hw->mac_addr);
 
-	ifmedia_init(&sc->alx_media, IFM_IMASK, alx_media_change,
-	    alx_media_status);
-	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_AUTO, 0, NULL);
-	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_10_T, 0, NULL);
-	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_10_T | IFM_FDX, 0, NULL);
-	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX, 0, NULL);
-	ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
-	if (ALX_CAP(hw, GIGA)) {
-		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T, 0, NULL);
-		ifmedia_add(&sc->alx_media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0,
-		    NULL);
-	}
-	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
+	error = alx_alloc_intr(sc);
+	if (error != 0)
+		goto fail;
 
 fail:
 	if (error != 0)
