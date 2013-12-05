@@ -107,8 +107,9 @@ static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 
 static void	alx_init_rx_ring(struct alx_softc *);
 static void	alx_init_tx_ring(struct alx_softc *);
+static int	alx_newbuf(struct alx_softc *, int);
 static void	alx_rxintr(struct alx_softc *);
-static int	alx_rx_newbuf(struct alx_softc *, int);
+static void	alx_txintr(struct alx_softc *);
 static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
 static device_method_t alx_methods[] = {
@@ -575,7 +576,7 @@ alx_init_rx_ring(struct alx_softc *sc)
 
 	/* XXX multiple queues. */
 	for (i = 0; i < sc->rx_ringsz; i++) {
-		error = alx_rx_newbuf(sc, i);
+		error = alx_newbuf(sc, i);
 		if (error != 0) {
 			/* XXX this needs to be handled better. */
 			device_printf(sc->alx_dev, "failed to refresh mbufs\n");
@@ -688,7 +689,7 @@ alx_rxintr(struct alx_softc *sc)
 		rrd_pidx = sc->alx_rx_queue.pidx;
 		while (rrd_pidx != rrd_cidx) {
 			printf("refreshing mbuf at %d\n", rrd_pidx);
-			if (alx_rx_newbuf(sc, rrd_pidx) != 0)
+			if (alx_newbuf(sc, rrd_pidx) != 0)
 				break;
 			if (++rrd_pidx == sc->rx_ringsz)
 				rrd_pidx = 0;
@@ -704,8 +705,48 @@ alx_rxintr(struct alx_softc *sc)
 	}
 }
 
+static void
+alx_txintr(struct alx_softc *sc)
+{
+	struct ifnet *ifp;
+	struct alx_buffer *tx_buf;
+	int tpd_cidx, tpd_hw_cidx;
+
+	ALX_LOCK_ASSERT(sc);
+
+	ifp = sc->alx_ifp;
+
+	tpd_cidx = sc->alx_tx_queue.cidx;
+	ALX_MEM_R16(&sc->hw, ALX_TPD_PRI0_CIDX, &tpd_hw_cidx);
+#if 0
+	bus_dmamap_sync(sc->alx_tx_tag, sc->alx_tx_dmamap,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+#endif
+
+	printf("in txintr cidx is %d, hw_cidx is %d\n", tpd_cidx, tpd_hw_cidx);
+
+	while (tpd_cidx != tpd_hw_cidx) {
+		tx_buf = &sc->alx_tx_queue.bf_info[tpd_cidx];
+		if (tx_buf->m == NULL)
+			continue;
+
+		/* Tear down the DMA mapping for the used mbuf. */
+		bus_dmamap_sync(sc->alx_tx_buf_tag, tx_buf->dmamap,
+		    BUS_DMASYNC_POSTWRITE);
+		bus_dmamap_unload(sc->alx_tx_buf_tag, tx_buf->dmamap);
+
+		m_freem(tx_buf->m);
+		tx_buf->m = NULL;
+
+		if (++tpd_cidx == sc->tx_ringsz)
+			tpd_cidx = 0;
+	}
+
+	sc->alx_tx_queue.cidx = tpd_cidx;
+}
+
 static int
-alx_rx_newbuf(struct alx_softc *sc, int index)
+alx_newbuf(struct alx_softc *sc, int index)
 {
 	struct mbuf *m;
 	bus_dma_segment_t seg;
@@ -968,7 +1009,9 @@ alx_int_task(void *context, int pending __unused)
 
 	ALX_LOCK(sc);
 
+	/* XXX check isr? */
 	alx_rxintr(sc);
+	alx_txintr(sc);
 
 	ALX_UNLOCK(sc);
 }
