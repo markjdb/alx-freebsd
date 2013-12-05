@@ -633,7 +633,7 @@ alx_rxintr(struct alx_softc *sc)
 	struct ifnet *ifp;
 	struct alx_buffer *rx_buf;
 	struct rrd_desc *rrd;
-	int rrd_cidx, rfd_cidx, count;
+	int rrd_cidx, rfd_cidx, rrd_pidx, count;
 
 	ALX_LOCK_ASSERT(sc);
 
@@ -672,6 +672,8 @@ alx_rxintr(struct alx_softc *sc)
 		m->m_pkthdr.len = m->m_len;
 		m->m_pkthdr.rcvif = ifp;
 
+		printf("read a %d-byte packet\n", m->m_len);
+
 		/* Pass the packet up the stack. */
 		ALX_UNLOCK(sc);
 		(*ifp->if_input)(ifp, m);
@@ -686,6 +688,18 @@ alx_rxintr(struct alx_softc *sc)
 
 	if (count > 0) {
 		sc->alx_rx_queue.cidx = rrd_cidx;
+
+		/* Refresh mbufs. */
+		rrd_pidx = sc->alx_rx_queue.pidx;
+		while (rrd_pidx != rrd_cidx) {
+			printf("refreshing mbuf at %d\n", rrd_pidx);
+			if (alx_rx_newbuf(sc, rrd_pidx) != 0)
+				break;
+			if (++rrd_pidx == sc->rx_ringsz)
+				rrd_pidx = 0;
+		}
+		sc->alx_rx_queue.pidx = rrd_pidx;
+
 		/* Sync receive descriptors. */
 		bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
 		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
@@ -720,7 +734,6 @@ alx_rx_newbuf(struct alx_softc *sc, int index)
 
 	rfd = &sc->alx_rx_queue.rfd_hdr[index];
 	rfd->addr = htole64(seg.ds_addr);
-	printf("loading mbuf at 0x%lx\n", rfd->addr);
 
 	return (0);
 }
