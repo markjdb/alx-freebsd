@@ -58,12 +58,6 @@
 MODULE_DEPEND(alx, pci, 1, 1, 1);
 MODULE_DEPEND(alx, ether, 1, 1, 1);
 
-#define DRV_MAJ		1
-#define DRV_MIN		2
-#define DRV_PATCH	3
-#define DRV_MODULE_VER	\
-	__stringify(DRV_MAJ) "." __stringify(DRV_MIN) "." __stringify(DRV_PATCH)
-
 static struct alx_dev {
 	uint16_t	 alx_vendorid;
 	uint16_t	 alx_deviceid;
@@ -324,7 +318,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
 	    PAGE_SIZE,				/* maxsize XXX */
-	    1,					/* nsegments XXX */
+	    32,					/* nsegments XXX */
 	    PAGE_SIZE,				/* maxsegsize */
 	    0,					/* flags */
 	    NULL, NULL,				/* lockfunc, lockarg */
@@ -655,10 +649,11 @@ alx_rxintr(struct alx_softc *sc)
 
 		/* Get the index of the corresponding RFD. */
 		rfd_cidx = FIELD_GETX(rrd->word0, RRD_SI);
-		if (rfd_cidx != sc->alx_rx_queue.cidx ||
+		if (rfd_cidx != rrd_cidx ||
 		    FIELD_GETX(rrd->word0, RRD_NOR) != 1) {
 			device_printf(sc->alx_dev,
-			    "RX consumer index mismatch\n");
+			    "RX consumer index mismatch: %d vs. %d, and %d\n",
+			    rrd_cidx, rfd_cidx, FIELD_GETX(rrd->word0, RRD_NOR));
 			/* XXX reset the chip? */
 			return;
 		}
@@ -699,6 +694,7 @@ alx_rxintr(struct alx_softc *sc)
 				rrd_pidx = 0;
 		}
 		sc->alx_rx_queue.pidx = rrd_pidx;
+		ALX_MEM_W16(&sc->hw, ALX_RFD_PIDX, rrd_pidx);
 
 		/* Sync receive descriptors. */
 		bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
@@ -743,7 +739,7 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 {
 	struct mbuf *m;
 	bus_dma_segment_t seg;
-	bus_dmamap_t map;
+	bus_dmamap_t txmap;
 	struct tpd_desc *td;
 	struct alx_buffer *tx_buf, *tx_buf_mapped;
 	int desci, error, nsegs, i;
@@ -757,14 +753,12 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 
 	desci = sc->alx_tx_queue.pidx;
 	tx_buf = tx_buf_mapped = &sc->alx_tx_queue.bf_info[desci];
-	map = tx_buf->dmamap;
+	txmap = tx_buf->dmamap;
 
-	/* XXX figure out how segments the DMA engine can support. */
-retry:
-	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, map, *m_head, &seg,
-	    &nsegs, 0);
+	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, txmap, *m_head,
+	    &seg, &nsegs, 0);
 	if (error == EFBIG) {
-		m = m_collapse(*m_head, M_NOWAIT, 1);
+		m = m_collapse(*m_head, M_NOWAIT, 32 /* XXX magic */);
 		if (m == NULL) {
 			/* XXX increment counter? */
 			m_freem(*m_head);
@@ -772,11 +766,22 @@ retry:
 			return (ENOBUFS);
 		}
 		*m_head = m;
-		/* XXX how do we guarantee this won't loop forever? */
-		goto retry;
+		/*
+		 * Try to create the mapping again now that some of the
+		 * fragments have been coalesced.
+		 */
+		error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, txmap,
+		    *m_head, &seg, &nsegs, 0);
+		if (error != 0) {
+			m_freem(*m_head);
+			*m_head = NULL;
+			return (error);
+		}
 	} else if (error != 0)
 		/* XXX increment counter? */
 		return (error);
+
+	printf("mbuf is fragged into %d segments\n", nsegs);
 
 	if (nsegs == 0) {
 		m_freem(*m_head);
@@ -789,7 +794,7 @@ retry:
 	/* XXX what's up with the - 2? It's in em(4) and age(4). */
 	if (nsegs > sc->alx_tx_queue.count - 2) {
 		/* XXX increment counter? */
-		bus_dmamap_unload(sc->alx_tx_tag, map);
+		bus_dmamap_unload(sc->alx_tx_tag, txmap);
 		return (ENOBUFS);
 	}
 
@@ -816,12 +821,13 @@ retry:
 	 * an unused map.
 	 */
 	tx_buf_mapped->dmamap = tx_buf->dmamap;
-	tx_buf->dmamap = map;
-	bus_dmamap_sync(sc->alx_tx_buf_tag, map, BUS_DMASYNC_PREWRITE);
+	tx_buf->dmamap = txmap;
+	bus_dmamap_sync(sc->alx_tx_buf_tag, txmap, BUS_DMASYNC_PREWRITE);
 
 	/* Let the hardware know that we're all set. */
 	bus_dmamap_sync(sc->alx_tx_tag, sc->alx_tx_dmamap,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+
 	ALX_MEM_W16(&sc->hw, sc->alx_tx_queue.p_reg, desci);
 
 	return (0);
