@@ -323,7 +323,7 @@ alx_reset_mac(struct alx_hw *hw)
 }
 
 /* alx_reset_phy
- *     completely reset phy, all settings/workaround will be re-configured
+ *     completely reset phy, all settings/workaround will be re-configureed
  *     hib_en: enable/disable hibernation on PHY
  */
 void
@@ -419,7 +419,8 @@ alx_reset_phy(struct alx_hw *hw, bool hib_en)
 
 set_imr:
 	/* set phy interrupt mask */
-	alx_write_phy_reg(hw, ALX_MII_IER, ALX_IER_LINK_UP | ALX_IER_LINK_DOWN);
+	alx_write_phy_reg(hw, ALX_MII_IER,
+		ALX_IER_LINK_UP | ALX_IER_LINK_DOWN);
 }
 
 #define ALX_PCI_CMD	(\
@@ -989,7 +990,6 @@ int __alx_read_phy_reg(struct alx_hw *hw, u16 reg, u16 *phy_data)
 /* write to PHY normal register */
 int __alx_write_phy_reg(struct alx_hw *hw, u16 reg, u16 phy_data)
 {
-	printf("alx_hw: writing 0x%x to register 0x%x, PHY 0\n", phy_data, reg);
 	return __alx_write_phy_core(hw, false, 0, reg, phy_data);
 }
 
