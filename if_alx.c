@@ -113,7 +113,7 @@ static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 
 static void	alx_init_rx_ring(struct alx_softc *);
 static void	alx_init_tx_ring(struct alx_softc *);
-static void	alx_rx_intr(struct alx_softc *);
+static void	alx_rxintr(struct alx_softc *);
 static int	alx_rx_newbuf(struct alx_softc *, int);
 static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
@@ -175,6 +175,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	dev = sc->alx_dev;
 	hw = &sc->hw;
 
+	/* Create parent tag. */
 	error = bus_dma_tag_create(
 	    bus_get_dma_tag(sc->alx_dev),	/* parent */
 	    1, 0,				/* alignment, boundary */
@@ -273,7 +274,7 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
-	/* Create the DMA tag for the receive ready descriptor ring. */
+	/* Create the DMA tag for the receive free descriptor ring. */
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
 	    sc->alx_parent_tag,			/* parent */
@@ -322,8 +323,8 @@ alx_dma_alloc(struct alx_softc *sc)
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
-	    PAGE_SIZE,				/* maxsize */
-	    1,					/* nsegments */
+	    PAGE_SIZE,				/* maxsize XXX */
+	    1,					/* nsegments XXX */
 	    PAGE_SIZE,				/* maxsegsize */
 	    0,					/* flags */
 	    NULL, NULL,				/* lockfunc, lockarg */
@@ -376,7 +377,6 @@ alx_dma_alloc(struct alx_softc *sc)
 	}
 
 	/* Allocate space for the RX buffer ring. */
-	/* XXX does this need to be M_NOWAIT? */
 	sc->alx_rx_queue.bf_info = malloc(
 	    sc->rx_ringsz * sizeof(struct alx_buffer), M_DEVBUF,
 	    M_NOWAIT | M_ZERO);
@@ -522,8 +522,6 @@ alx_init_sw(struct alx_softc *sc)
 	hw->rss_idt_size = 128;
 	hw->rss_hash_type = ALX_RSS_HASH_TYPE_ALL;
 	hw->smb_timer = 400;
-	hw->mtu = 1500; // XXX sc->alx_ifp->if_mtu;
-	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
 	sc->tx_ringsz = 256;
 	sc->rx_ringsz = 512;
 	hw->sleep_ctrl = ALX_SLEEP_WOL_MAGIC | ALX_SLEEP_WOL_PHY;
@@ -557,7 +555,6 @@ static void
 alx_init_rx_ring(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
-	struct alx_buffer *rx_buf;
 	int i, error;
 
 	ALX_LOCK_ASSERT(sc);
@@ -574,10 +571,16 @@ alx_init_rx_ring(struct alx_softc *sc)
 
 	hw->imask |= ALX_ISR_RX_Q0;
 
+	/* XXX the rings are all supposed to come from the same 4GB block. */
+	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, sc->alx_rx_queue.rfd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_RRD_ADDR_LO, sc->alx_rx_queue.rrd_dma);
+	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma);
+	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
+
 	/* XXX multiple queues. */
 	for (i = 0; i < sc->rx_ringsz; i++) {
-		rx_buf = &sc->alx_rx_queue.bf_info[i];
-		rx_buf->m = NULL;
 		error = alx_rx_newbuf(sc, i);
 		if (error != 0) {
 			/* XXX this needs to be handled better. */
@@ -586,13 +589,10 @@ alx_init_rx_ring(struct alx_softc *sc)
 		}
 	}
 
-	/* XXX I guess the RFD and RRD rings must come from the same block? */
-	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma & 0xffffffff);
-	ALX_MEM_W32(hw, ALX_RRD_ADDR_LO, sc->alx_rx_queue.rrd_dma & 0xffffffff);
-	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, sc->alx_rx_queue.rfd_dma >> 32);
-	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
+	ALX_MEM_W16(hw, ALX_RFD_PIDX, sc->rx_ringsz - 1);
+
+	bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+	    BUS_DMASYNC_PREWRITE);
 }
 
 static void
@@ -621,30 +621,35 @@ alx_init_tx_ring(struct alx_softc *sc)
 	}
 
 	/* XXX multiple queues */
-	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma & 0xffffffff);
 	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma);
 	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
 }
 
 static void
-alx_rx_intr(struct alx_softc *sc)
+alx_rxintr(struct alx_softc *sc)
 {
 	struct mbuf *m;
 	struct ifnet *ifp;
 	struct alx_buffer *rx_buf;
 	struct rrd_desc *rrd;
-	int rrd_cidx, rrd_pidx, rfd_cidx, i;
+	int rrd_cidx, rfd_cidx, count;
 
 	ALX_LOCK_ASSERT(sc);
 
-	ifp = sc->alx_ifp;
-	rrd_cidx = sc->alx_rx_queue.cidx;
-	rrd_pidx = sc->alx_rx_queue.pidx;
+	bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+	bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
-	for (i = 0; rrd_cidx != rrd_pidx; i++) {
-		rrd_cidx = sc->alx_rx_queue.cidx;
+	ifp = sc->alx_ifp;
+
+	count = 0;
+	rrd_cidx = sc->alx_rx_queue.cidx;
+	printf("consuming packets starting at %d\n", rrd_cidx);
+	while (1) {
 		rrd = &sc->alx_rx_queue.rrd_hdr[rrd_cidx];
-		if (!(rrd->word3 & (1 << RRD_UPDATED_SHIFT)))
+		if ((rrd->word3 & (1 << RRD_UPDATED_SHIFT)) == 0)
 			break;
 		rrd->word3 &= ~(1 << RRD_UPDATED_SHIFT);
 
@@ -671,6 +676,21 @@ alx_rx_intr(struct alx_softc *sc)
 		ALX_UNLOCK(sc);
 		(*ifp->if_input)(ifp, m);
 		ALX_LOCK(sc);
+
+		count++;
+		if (++rrd_cidx == sc->rx_ringsz)
+			rrd_cidx = 0;
+	}
+
+	printf("consumed %d packets\n", count);
+
+	if (count > 0) {
+		sc->alx_rx_queue.cidx = rrd_cidx;
+		/* Sync receive descriptors. */
+		bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
+		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+		bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 	}
 }
 
@@ -689,15 +709,18 @@ alx_rx_newbuf(struct alx_softc *sc, int index)
 	m->m_len = m->m_pkthdr.len = MCLBYTES;
 
 	rx_buf = &sc->alx_rx_queue.bf_info[index];
-	rx_buf->m = m;
 	if (bus_dmamap_load_mbuf_sg(sc->alx_rx_buf_tag, rx_buf->dmamap, m, &seg,
 	    &nsegs, 0) != 0) {
 		m_freem(m);
 		return (ENOBUFS);
 	}
+	rx_buf->m = m;
+	bus_dmamap_sync(sc->alx_rx_buf_tag, rx_buf->dmamap,
+	    BUS_DMASYNC_PREREAD);
 
 	rfd = &sc->alx_rx_queue.rfd_hdr[index];
 	rfd->addr = htole64(seg.ds_addr);
+	printf("loading mbuf at 0x%lx\n", rfd->addr);
 
 	return (0);
 }
@@ -920,9 +943,15 @@ alx_int_task(void *context, int pending __unused)
 {
 	struct alx_softc *sc;
 
+	printf("in alx_int_task\n");
+
 	sc = context;
 
-	alx_rx_intr(sc);
+	ALX_LOCK(sc);
+
+	alx_rxintr(sc);
+
+	ALX_UNLOCK(sc);
 }
 
 static void
@@ -960,6 +989,8 @@ alx_intr_legacy(void *arg)
 	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
 		return (FILTER_STRAY);
 
+	printf("intr is 0x%x, imask is 0x%x\n", intr, hw->imask);
+
 	/* Acknowledge and disable interrupts. */
 	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
 
@@ -967,8 +998,11 @@ alx_intr_legacy(void *arg)
 	if (intr & ALX_ISR_PHY) {
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
-		taskqueue_enqueue(taskqueue_swi, &sc->alx_link_task);
+		taskqueue_enqueue(sc->alx_tq, &sc->alx_link_task);
 	}
+
+	if (intr & (ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0))
+		taskqueue_enqueue(sc->alx_tq, &sc->alx_int_task);
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
 
@@ -993,7 +1027,7 @@ alx_intr_msi(void *arg)
 	if (intr & ALX_ISR_PHY) {
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
-		taskqueue_enqueue(taskqueue_swi, &sc->alx_link_task);
+		taskqueue_enqueue(sc->alx_tq, &sc->alx_link_task);
 	}
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
@@ -1052,14 +1086,14 @@ alx_alloc_intr(struct alx_softc *sc)
 		return (ENXIO);
 	}
 
+	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
+	TASK_INIT(&sc->alx_link_task, 0, alx_link_task, sc);
 	sc->alx_tq = taskqueue_create_fast("alx_taskq", M_WAITOK,
 	    taskqueue_thread_enqueue, &sc->alx_tq);
 	if (sc->alx_tq == NULL) {
 		device_printf(dev, "could not create taskqueue\n");
 		return (ENXIO);
 	}
-	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
-	TASK_INIT(&sc->alx_link_task, 0, alx_link_task, sc);
 	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
 	    device_get_nameunit(sc->alx_dev));
 
@@ -1219,6 +1253,9 @@ alx_init_locked(struct alx_softc *sc)
 	alx_init_rx_ring(sc);
 	alx_init_tx_ring(sc);
 
+	printf("rfd: 0x%lx, rrd: 0x%lx, txd: 0x%lx\n", sc->alx_rx_queue.rfd_dma,
+	    sc->alx_rx_queue.rrd_dma, sc->alx_tx_queue.tpd_dma);
+
 	/* Load the DMA pointers. */
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
 
@@ -1332,12 +1369,14 @@ alx_attach(device_t dev)
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
 
+#ifdef __notyet
 	error = pci_set_powerstate(dev, PCI_POWERSTATE_D0);
 	if (error != 0) {
 		device_printf(dev, "failed to set PCI power state to D0\n");
 		error = ENXIO;
 		goto fail;
 	}
+#endif
 
 	pci_enable_busmaster(dev);
 
@@ -1431,6 +1470,9 @@ alx_attach(device_t dev)
 	}
 	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
 
+	hw->mtu = sc->alx_ifp->if_mtu;
+	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
+	printf("rxbuf size is %d\n", sc->rxbuf_size);
 fail:
 	if (error != 0)
 		alx_detach(dev);
