@@ -86,15 +86,9 @@
  */
 
 struct tpd_desc {
-	__le32 word0;
-	__le32 word1;
-	union {
-		__le64 addr;
-		struct {
-			__le32 pkt_len;
-			__le32 resvd;
-		} l;
-	} adrl;
+	uint32_t	len;
+	uint32_t	flags;
+	uint64_t	addr;
 } __packed;
 
 /* tpd word 0 */

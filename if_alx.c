@@ -654,7 +654,8 @@ alx_rxintr(struct alx_softc *sc)
 		    FIELD_GETX(rrd->word0, RRD_NOR) != 1) {
 			device_printf(sc->alx_dev,
 			    "RX consumer index mismatch: %d vs. %d, and %d\n",
-			    rrd_cidx, rfd_cidx, FIELD_GETX(rrd->word0, RRD_NOR));
+			    rrd_cidx, rfd_cidx,
+			    FIELD_GETX(rrd->word0, RRD_NOR));
 			/* XXX reset the chip? */
 			return;
 		}
@@ -718,17 +719,18 @@ alx_txintr(struct alx_softc *sc)
 
 	tpd_cidx = sc->alx_tx_queue.cidx;
 	ALX_MEM_R16(&sc->hw, ALX_TPD_PRI0_CIDX, &tpd_hw_cidx);
-#if 0
-	bus_dmamap_sync(sc->alx_tx_tag, sc->alx_tx_dmamap,
-	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-#endif
 
 	printf("in txintr cidx is %d, hw_cidx is %d\n", tpd_cidx, tpd_hw_cidx);
 
 	while (tpd_cidx != tpd_hw_cidx) {
 		tx_buf = &sc->alx_tx_queue.bf_info[tpd_cidx];
-		if (tx_buf->m == NULL)
+		if (tx_buf->m == NULL) {
+			if (++tpd_cidx == sc->tx_ringsz)
+				tpd_cidx = 0;
 			continue;
+		}
+
+		ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
 
 		/* Tear down the DMA mapping for the used mbuf. */
 		bus_dmamap_sync(sc->alx_tx_buf_tag, tx_buf->dmamap,
@@ -779,7 +781,7 @@ static int
 alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 {
 	struct mbuf *m;
-	bus_dma_segment_t seg;
+	bus_dma_segment_t segs[32];
 	bus_dmamap_t txmap;
 	struct tpd_desc *td;
 	struct alx_buffer *tx_buf, *tx_buf_mapped;
@@ -797,7 +799,7 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 	txmap = tx_buf->dmamap;
 
 	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, txmap, *m_head,
-	    &seg, &nsegs, 0);
+	    segs, &nsegs, 0);
 	if (error == EFBIG) {
 		m = m_collapse(*m_head, M_NOWAIT, 32 /* XXX magic */);
 		if (m == NULL) {
@@ -812,7 +814,7 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 		 * fragments have been coalesced.
 		 */
 		error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, txmap,
-		    *m_head, &seg, &nsegs, 0);
+		    *m_head, segs, &nsegs, 0);
 		if (error != 0) {
 			m_freem(*m_head);
 			*m_head = NULL;
@@ -821,8 +823,6 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 	} else if (error != 0)
 		/* XXX increment counter? */
 		return (error);
-
-	printf("mbuf is fragged into %d segments\n", nsegs);
 
 	if (nsegs == 0) {
 		m_freem(*m_head);
@@ -833,6 +833,7 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 
 	/* Make sure we have enough descriptors available. */
 	/* XXX what's up with the - 2? It's in em(4) and age(4). */
+	/* XXX count isn't ever modified. */
 	if (nsegs > sc->alx_tx_queue.count - 2) {
 		/* XXX increment counter? */
 		bus_dmamap_unload(sc->alx_tx_tag, txmap);
@@ -841,14 +842,13 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 
 	for (i = 0; i < nsegs; i++, desci = ALX_TX_INC(desci, sc)) {
 		td = &sc->alx_tx_queue.tpd_hdr[desci];
-		/* XXX handle multiple segments. */
-		td->adrl.addr = htole64(seg.ds_addr);
-		FIELD_SET32(td->word0, TPD_BUFLEN, seg.ds_len);
-		td->word1 = 0;
+		td->addr = htole64(segs[i].ds_addr);
+		td->len = htole32(segs[i].ds_len);
+		td->flags = 0;
 	}
 
 	/* This is the last descriptor for this packet. */
-	td->word1 |= 1 << TPD_EOP_SHIFT;
+	td->flags |= 1 << TPD_EOP_SHIFT;
 
 	/* Update the producer index. */
 	sc->alx_tx_queue.pidx = desci;
@@ -1533,6 +1533,7 @@ alx_attach(device_t dev)
 	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
 
 	hw->mtu = sc->alx_ifp->if_mtu;
+	//sc->rxbuf_size = MCLBYTES;
 	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
 	printf("rxbuf size is %d\n", sc->rxbuf_size);
 fail:
