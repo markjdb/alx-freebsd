@@ -58,12 +58,6 @@
 MODULE_DEPEND(alx, pci, 1, 1, 1);
 MODULE_DEPEND(alx, ether, 1, 1, 1);
 
-#define DRV_MAJ		1
-#define DRV_MIN		2
-#define DRV_PATCH	3
-#define DRV_MODULE_VER	\
-	__stringify(DRV_MAJ) "." __stringify(DRV_MIN) "." __stringify(DRV_PATCH)
-
 static struct alx_dev {
 	uint16_t	 alx_vendorid;
 	uint16_t	 alx_deviceid;
@@ -113,8 +107,9 @@ static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 
 static void	alx_init_rx_ring(struct alx_softc *);
 static void	alx_init_tx_ring(struct alx_softc *);
-static void	alx_rx_intr(struct alx_softc *);
-static int	alx_rx_newbuf(struct alx_softc *, int);
+static int	alx_newbuf(struct alx_softc *, int);
+static void	alx_rxintr(struct alx_softc *);
+static void	alx_txintr(struct alx_softc *);
 static int	alx_xmit(struct alx_softc *, struct mbuf **);
 
 static device_method_t alx_methods[] = {
@@ -175,6 +170,7 @@ alx_dma_alloc(struct alx_softc *sc)
 	dev = sc->alx_dev;
 	hw = &sc->hw;
 
+	/* Create parent tag. */
 	error = bus_dma_tag_create(
 	    bus_get_dma_tag(sc->alx_dev),	/* parent */
 	    1, 0,				/* alignment, boundary */
@@ -273,7 +269,7 @@ alx_dma_alloc(struct alx_softc *sc)
 		return (error);
 	}
 
-	/* Create the DMA tag for the receive ready descriptor ring. */
+	/* Create the DMA tag for the receive free descriptor ring. */
 	/* XXX assuming 1 queue at the moment. */
 	error = bus_dma_tag_create(
 	    sc->alx_parent_tag,			/* parent */
@@ -322,8 +318,8 @@ alx_dma_alloc(struct alx_softc *sc)
 	    BUS_SPACE_MAXADDR,			/* lowaddr */
 	    BUS_SPACE_MAXADDR,			/* highaddr */
 	    NULL, NULL,				/* filter, filterarg */
-	    PAGE_SIZE,				/* maxsize */
-	    1,					/* nsegments */
+	    PAGE_SIZE,				/* maxsize XXX */
+	    32,					/* nsegments XXX */
 	    PAGE_SIZE,				/* maxsegsize */
 	    0,					/* flags */
 	    NULL, NULL,				/* lockfunc, lockarg */
@@ -376,7 +372,6 @@ alx_dma_alloc(struct alx_softc *sc)
 	}
 
 	/* Allocate space for the RX buffer ring. */
-	/* XXX does this need to be M_NOWAIT? */
 	sc->alx_rx_queue.bf_info = malloc(
 	    sc->rx_ringsz * sizeof(struct alx_buffer), M_DEVBUF,
 	    M_NOWAIT | M_ZERO);
@@ -522,8 +517,6 @@ alx_init_sw(struct alx_softc *sc)
 	hw->rss_idt_size = 128;
 	hw->rss_hash_type = ALX_RSS_HASH_TYPE_ALL;
 	hw->smb_timer = 400;
-	hw->mtu = 1500; // XXX sc->alx_ifp->if_mtu;
-	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
 	sc->tx_ringsz = 256;
 	sc->rx_ringsz = 512;
 	hw->sleep_ctrl = ALX_SLEEP_WOL_MAGIC | ALX_SLEEP_WOL_PHY;
@@ -557,7 +550,6 @@ static void
 alx_init_rx_ring(struct alx_softc *sc)
 {
 	struct alx_hw *hw;
-	struct alx_buffer *rx_buf;
 	int i, error;
 
 	ALX_LOCK_ASSERT(sc);
@@ -574,11 +566,17 @@ alx_init_rx_ring(struct alx_softc *sc)
 
 	hw->imask |= ALX_ISR_RX_Q0;
 
+	/* XXX the rings are all supposed to come from the same 4GB block. */
+	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, sc->alx_rx_queue.rfd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_RRD_ADDR_LO, sc->alx_rx_queue.rrd_dma);
+	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma);
+	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
+	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
+
 	/* XXX multiple queues. */
 	for (i = 0; i < sc->rx_ringsz; i++) {
-		rx_buf = &sc->alx_rx_queue.bf_info[i];
-		rx_buf->m = NULL;
-		error = alx_rx_newbuf(sc, i);
+		error = alx_newbuf(sc, i);
 		if (error != 0) {
 			/* XXX this needs to be handled better. */
 			device_printf(sc->alx_dev, "failed to refresh mbufs\n");
@@ -586,13 +584,10 @@ alx_init_rx_ring(struct alx_softc *sc)
 		}
 	}
 
-	/* XXX I guess the RFD and RRD rings must come from the same block? */
-	ALX_MEM_W32(hw, ALX_RFD_ADDR_LO, sc->alx_rx_queue.rfd_dma & 0xffffffff);
-	ALX_MEM_W32(hw, ALX_RRD_ADDR_LO, sc->alx_rx_queue.rrd_dma & 0xffffffff);
-	ALX_MEM_W32(hw, ALX_RX_BASE_ADDR_HI, sc->alx_rx_queue.rfd_dma >> 32);
-	ALX_MEM_W32(hw, ALX_RRD_RING_SZ, sc->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_RING_SZ, sc->rx_ringsz);
-	ALX_MEM_W32(hw, ALX_RFD_BUF_SZ, sc->rxbuf_size);
+	ALX_MEM_W16(hw, ALX_RFD_PIDX, sc->rx_ringsz - 1);
+
+	bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+	    BUS_DMASYNC_PREWRITE);
 }
 
 static void
@@ -621,39 +616,46 @@ alx_init_tx_ring(struct alx_softc *sc)
 	}
 
 	/* XXX multiple queues */
-	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma & 0xffffffff);
 	ALX_MEM_W32(hw, ALX_TX_BASE_ADDR_HI, sc->alx_tx_queue.tpd_dma >> 32);
+	ALX_MEM_W32(hw, ALX_TPD_PRI0_ADDR_LO, sc->alx_tx_queue.tpd_dma);
 	ALX_MEM_W32(hw, ALX_TPD_RING_SZ, sc->tx_ringsz);
 }
 
 static void
-alx_rx_intr(struct alx_softc *sc)
+alx_rxintr(struct alx_softc *sc)
 {
 	struct mbuf *m;
 	struct ifnet *ifp;
 	struct alx_buffer *rx_buf;
 	struct rrd_desc *rrd;
-	int rrd_cidx, rrd_pidx, rfd_cidx, i;
+	int rrd_cidx, rfd_cidx, rrd_pidx, count;
 
 	ALX_LOCK_ASSERT(sc);
 
-	ifp = sc->alx_ifp;
-	rrd_cidx = sc->alx_rx_queue.cidx;
-	rrd_pidx = sc->alx_rx_queue.pidx;
+	bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+	bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
-	for (i = 0; rrd_cidx != rrd_pidx; i++) {
-		rrd_cidx = sc->alx_rx_queue.cidx;
+	ifp = sc->alx_ifp;
+
+	count = 0;
+	rrd_cidx = sc->alx_rx_queue.cidx;
+	printf("consuming packets starting at %d\n", rrd_cidx);
+	while (1) {
 		rrd = &sc->alx_rx_queue.rrd_hdr[rrd_cidx];
-		if (!(rrd->word3 & (1 << RRD_UPDATED_SHIFT)))
+		if ((rrd->word3 & (1 << RRD_UPDATED_SHIFT)) == 0)
 			break;
 		rrd->word3 &= ~(1 << RRD_UPDATED_SHIFT);
 
 		/* Get the index of the corresponding RFD. */
 		rfd_cidx = FIELD_GETX(rrd->word0, RRD_SI);
-		if (rfd_cidx != sc->alx_rx_queue.cidx ||
+		if (rfd_cidx != rrd_cidx ||
 		    FIELD_GETX(rrd->word0, RRD_NOR) != 1) {
 			device_printf(sc->alx_dev,
-			    "RX consumer index mismatch\n");
+			    "RX consumer index mismatch: %d vs. %d, and %d\n",
+			    rrd_cidx, rfd_cidx,
+			    FIELD_GETX(rrd->word0, RRD_NOR));
 			/* XXX reset the chip? */
 			return;
 		}
@@ -667,15 +669,86 @@ alx_rx_intr(struct alx_softc *sc)
 		m->m_pkthdr.len = m->m_len;
 		m->m_pkthdr.rcvif = ifp;
 
+		printf("read a %d-byte packet\n", m->m_len);
+
 		/* Pass the packet up the stack. */
 		ALX_UNLOCK(sc);
 		(*ifp->if_input)(ifp, m);
 		ALX_LOCK(sc);
+
+		count++;
+		if (++rrd_cidx == sc->rx_ringsz)
+			rrd_cidx = 0;
+	}
+
+	printf("consumed %d packets\n", count);
+
+	if (count > 0) {
+		sc->alx_rx_queue.cidx = rrd_cidx;
+
+		/* Refresh mbufs. */
+		rrd_pidx = sc->alx_rx_queue.pidx;
+		while (rrd_pidx != rrd_cidx) {
+			printf("refreshing mbuf at %d\n", rrd_pidx);
+			if (alx_newbuf(sc, rrd_pidx) != 0)
+				break;
+			if (++rrd_pidx == sc->rx_ringsz)
+				rrd_pidx = 0;
+		}
+		sc->alx_rx_queue.pidx = rrd_pidx;
+		ALX_MEM_W16(&sc->hw, ALX_RFD_PIDX, rrd_pidx);
+
+		/* Sync receive descriptors. */
+		bus_dmamap_sync(sc->alx_rr_tag, sc->alx_rr_dmamap,
+		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+		bus_dmamap_sync(sc->alx_rx_tag, sc->alx_rx_dmamap,
+		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 	}
 }
 
+static void
+alx_txintr(struct alx_softc *sc)
+{
+	struct ifnet *ifp;
+	struct alx_buffer *tx_buf;
+	int tpd_cidx, tpd_hw_cidx;
+
+	ALX_LOCK_ASSERT(sc);
+
+	ifp = sc->alx_ifp;
+
+	tpd_cidx = sc->alx_tx_queue.cidx;
+	ALX_MEM_R16(&sc->hw, ALX_TPD_PRI0_CIDX, &tpd_hw_cidx);
+
+	printf("in txintr cidx is %d, hw_cidx is %d\n", tpd_cidx, tpd_hw_cidx);
+
+	while (tpd_cidx != tpd_hw_cidx) {
+		tx_buf = &sc->alx_tx_queue.bf_info[tpd_cidx];
+		if (tx_buf->m == NULL) {
+			if (++tpd_cidx == sc->tx_ringsz)
+				tpd_cidx = 0;
+			continue;
+		}
+
+		ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+
+		/* Tear down the DMA mapping for the used mbuf. */
+		bus_dmamap_sync(sc->alx_tx_buf_tag, tx_buf->dmamap,
+		    BUS_DMASYNC_POSTWRITE);
+		bus_dmamap_unload(sc->alx_tx_buf_tag, tx_buf->dmamap);
+
+		m_freem(tx_buf->m);
+		tx_buf->m = NULL;
+
+		if (++tpd_cidx == sc->tx_ringsz)
+			tpd_cidx = 0;
+	}
+
+	sc->alx_tx_queue.cidx = tpd_cidx;
+}
+
 static int
-alx_rx_newbuf(struct alx_softc *sc, int index)
+alx_newbuf(struct alx_softc *sc, int index)
 {
 	struct mbuf *m;
 	bus_dma_segment_t seg;
@@ -689,12 +762,14 @@ alx_rx_newbuf(struct alx_softc *sc, int index)
 	m->m_len = m->m_pkthdr.len = MCLBYTES;
 
 	rx_buf = &sc->alx_rx_queue.bf_info[index];
-	rx_buf->m = m;
 	if (bus_dmamap_load_mbuf_sg(sc->alx_rx_buf_tag, rx_buf->dmamap, m, &seg,
 	    &nsegs, 0) != 0) {
 		m_freem(m);
 		return (ENOBUFS);
 	}
+	rx_buf->m = m;
+	bus_dmamap_sync(sc->alx_rx_buf_tag, rx_buf->dmamap,
+	    BUS_DMASYNC_PREREAD);
 
 	rfd = &sc->alx_rx_queue.rfd_hdr[index];
 	rfd->addr = htole64(seg.ds_addr);
@@ -706,8 +781,8 @@ static int
 alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 {
 	struct mbuf *m;
-	bus_dma_segment_t seg;
-	bus_dmamap_t map;
+	bus_dma_segment_t segs[32];
+	bus_dmamap_t txmap;
 	struct tpd_desc *td;
 	struct alx_buffer *tx_buf, *tx_buf_mapped;
 	int desci, error, nsegs, i;
@@ -721,14 +796,12 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 
 	desci = sc->alx_tx_queue.pidx;
 	tx_buf = tx_buf_mapped = &sc->alx_tx_queue.bf_info[desci];
-	map = tx_buf->dmamap;
+	txmap = tx_buf->dmamap;
 
-	/* XXX figure out how segments the DMA engine can support. */
-retry:
-	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, map, *m_head, &seg,
-	    &nsegs, 0);
+	error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, txmap, *m_head,
+	    segs, &nsegs, 0);
 	if (error == EFBIG) {
-		m = m_collapse(*m_head, M_NOWAIT, 1);
+		m = m_collapse(*m_head, M_NOWAIT, 32 /* XXX magic */);
 		if (m == NULL) {
 			/* XXX increment counter? */
 			m_freem(*m_head);
@@ -736,8 +809,17 @@ retry:
 			return (ENOBUFS);
 		}
 		*m_head = m;
-		/* XXX how do we guarantee this won't loop forever? */
-		goto retry;
+		/*
+		 * Try to create the mapping again now that some of the
+		 * fragments have been coalesced.
+		 */
+		error = bus_dmamap_load_mbuf_sg(sc->alx_tx_buf_tag, txmap,
+		    *m_head, segs, &nsegs, 0);
+		if (error != 0) {
+			m_freem(*m_head);
+			*m_head = NULL;
+			return (error);
+		}
 	} else if (error != 0)
 		/* XXX increment counter? */
 		return (error);
@@ -751,22 +833,22 @@ retry:
 
 	/* Make sure we have enough descriptors available. */
 	/* XXX what's up with the - 2? It's in em(4) and age(4). */
+	/* XXX count isn't ever modified. */
 	if (nsegs > sc->alx_tx_queue.count - 2) {
 		/* XXX increment counter? */
-		bus_dmamap_unload(sc->alx_tx_tag, map);
+		bus_dmamap_unload(sc->alx_tx_tag, txmap);
 		return (ENOBUFS);
 	}
 
 	for (i = 0; i < nsegs; i++, desci = ALX_TX_INC(desci, sc)) {
 		td = &sc->alx_tx_queue.tpd_hdr[desci];
-		/* XXX handle multiple segments. */
-		td->adrl.addr = htole64(seg.ds_addr);
-		FIELD_SET32(td->word0, TPD_BUFLEN, seg.ds_len);
-		td->word1 = 0;
+		td->addr = htole64(segs[i].ds_addr);
+		td->len = htole32(segs[i].ds_len);
+		td->flags = 0;
 	}
 
 	/* This is the last descriptor for this packet. */
-	td->word1 |= 1 << TPD_EOP_SHIFT;
+	td->flags |= 1 << TPD_EOP_SHIFT;
 
 	/* Update the producer index. */
 	sc->alx_tx_queue.pidx = desci;
@@ -780,12 +862,13 @@ retry:
 	 * an unused map.
 	 */
 	tx_buf_mapped->dmamap = tx_buf->dmamap;
-	tx_buf->dmamap = map;
-	bus_dmamap_sync(sc->alx_tx_buf_tag, map, BUS_DMASYNC_PREWRITE);
+	tx_buf->dmamap = txmap;
+	bus_dmamap_sync(sc->alx_tx_buf_tag, txmap, BUS_DMASYNC_PREWRITE);
 
 	/* Let the hardware know that we're all set. */
 	bus_dmamap_sync(sc->alx_tx_tag, sc->alx_tx_dmamap,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+
 	ALX_MEM_W16(&sc->hw, sc->alx_tx_queue.p_reg, desci);
 
 	return (0);
@@ -920,9 +1003,17 @@ alx_int_task(void *context, int pending __unused)
 {
 	struct alx_softc *sc;
 
+	printf("in alx_int_task\n");
+
 	sc = context;
 
-	alx_rx_intr(sc);
+	ALX_LOCK(sc);
+
+	/* XXX check isr? */
+	alx_rxintr(sc);
+	alx_txintr(sc);
+
+	ALX_UNLOCK(sc);
 }
 
 static void
@@ -960,6 +1051,8 @@ alx_intr_legacy(void *arg)
 	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
 		return (FILTER_STRAY);
 
+	printf("intr is 0x%x, imask is 0x%x\n", intr, hw->imask);
+
 	/* Acknowledge and disable interrupts. */
 	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
 
@@ -967,8 +1060,11 @@ alx_intr_legacy(void *arg)
 	if (intr & ALX_ISR_PHY) {
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
-		taskqueue_enqueue(taskqueue_swi, &sc->alx_link_task);
+		taskqueue_enqueue(sc->alx_tq, &sc->alx_link_task);
 	}
+
+	if (intr & (ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0))
+		taskqueue_enqueue(sc->alx_tq, &sc->alx_int_task);
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
 
@@ -993,7 +1089,7 @@ alx_intr_msi(void *arg)
 	if (intr & ALX_ISR_PHY) {
 		hw->imask &= ~ALX_ISR_PHY;
 		ALX_MEM_W32(hw, ALX_IMR, hw->imask);
-		taskqueue_enqueue(taskqueue_swi, &sc->alx_link_task);
+		taskqueue_enqueue(sc->alx_tq, &sc->alx_link_task);
 	}
 
 	ALX_MEM_W32(hw, ALX_ISR, 0);
@@ -1052,14 +1148,14 @@ alx_alloc_intr(struct alx_softc *sc)
 		return (ENXIO);
 	}
 
+	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
+	TASK_INIT(&sc->alx_link_task, 0, alx_link_task, sc);
 	sc->alx_tq = taskqueue_create_fast("alx_taskq", M_WAITOK,
 	    taskqueue_thread_enqueue, &sc->alx_tq);
 	if (sc->alx_tq == NULL) {
 		device_printf(dev, "could not create taskqueue\n");
 		return (ENXIO);
 	}
-	TASK_INIT(&sc->alx_int_task, 0, alx_int_task, sc);
-	TASK_INIT(&sc->alx_link_task, 0, alx_link_task, sc);
 	taskqueue_start_threads(&sc->alx_tq, 1, PI_NET, "%s taskq",
 	    device_get_nameunit(sc->alx_dev));
 
@@ -1219,6 +1315,9 @@ alx_init_locked(struct alx_softc *sc)
 	alx_init_rx_ring(sc);
 	alx_init_tx_ring(sc);
 
+	printf("rfd: 0x%lx, rrd: 0x%lx, txd: 0x%lx\n", sc->alx_rx_queue.rfd_dma,
+	    sc->alx_rx_queue.rrd_dma, sc->alx_tx_queue.tpd_dma);
+
 	/* Load the DMA pointers. */
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
 
@@ -1332,12 +1431,14 @@ alx_attach(device_t dev)
 	hw->hw_addr = sc->alx_res;
 	hw->dev = dev;
 
+#ifdef __notyet
 	error = pci_set_powerstate(dev, PCI_POWERSTATE_D0);
 	if (error != 0) {
 		device_printf(dev, "failed to set PCI power state to D0\n");
 		error = ENXIO;
 		goto fail;
 	}
+#endif
 
 	pci_enable_busmaster(dev);
 
@@ -1431,6 +1532,10 @@ alx_attach(device_t dev)
 	}
 	ifmedia_set(&sc->alx_media, IFM_ETHER | IFM_AUTO);
 
+	hw->mtu = sc->alx_ifp->if_mtu;
+	//sc->rxbuf_size = MCLBYTES;
+	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
+	printf("rxbuf size is %d\n", sc->rxbuf_size);
 fail:
 	if (error != 0)
 		alx_detach(dev);

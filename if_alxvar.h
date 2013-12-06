@@ -14,8 +14,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef _ALX_H_
-#define _ALX_H_
+#ifndef _IF_ALXVAR_H_
+#define	_IF_ALXVAR_H_
 
 #define ALX_WATCHDOG_TIME   (5 * HZ)
 
@@ -34,25 +34,17 @@ struct alx_ring_header {
 struct alx_buffer {
 	struct mbuf	*m;
 	bus_dmamap_t	 dmamap;
-
-	/* buffer size */
-	DEFINE_DMA_UNMAP_LEN(size);
-	/* information of this buffer */
-	uint16_t	flags;
 };
 #define ALX_BUF_TX_FIRSTFRAG	0x1
 
 /* rx queue */
 struct alx_rx_queue {
-	/* rrd ring virtual addr */
 	struct rrd_desc *rrd_hdr;
-	/* rrd ring physical addr */
-	dma_addr_t rrd_dma;
-	/* rfd ring virtual addr */
+	bus_addr_t rrd_dma;
+
 	struct rfd_desc *rfd_hdr;
-	/* rfd ring physical addr */
-	dma_addr_t rfd_dma;
-	/* info for rx-skbs */
+	bus_addr_t rfd_dma;
+
 	struct alx_buffer *bf_info;
 
 	/* number of ring elements */
@@ -69,22 +61,17 @@ struct alx_rx_queue {
 	/* queue index */
 	uint16_t qidx;
 	unsigned long flag;
-
-#ifdef notyet
-	struct sk_buff_head list;
-#endif
 };
 #define ALX_RQ_USING		1
 #define ALX_RX_ALLOC_THRESH	32
 
 /* tx queue */
 struct alx_tx_queue {
-	/* tpd ring virtual addr */
 	struct tpd_desc *tpd_hdr;
-	/* tpd ring physical address. */
-	dma_addr_t tpd_dma;
-	/* info for tx-skbs pending on HW */
+	bus_addr_t tpd_dma;
+
 	struct alx_buffer *bf_info;
+
 	/* number of ring elements  */
 	uint16_t count;
 	/* producer index */
@@ -116,7 +103,6 @@ enum ALX_FLAGS {
 
 	ALX_FLAG_NUMBER_OF_FLAGS,
 };
-
 
 struct alx_hw;
 /*
@@ -197,9 +183,9 @@ struct alx_softc {
 	struct mtx		 alx_mtx;
 };
 
-#define ALX_LOCK(sc)		mtx_lock(&(sc)->alx_mtx)
-#define ALX_UNLOCK(sc)		mtx_unlock(&(sc)->alx_mtx)
-#define ALX_LOCK_ASSERT(sc)	mtx_assert(&(sc)->alx_mtx, MA_OWNED)
+#define	ALX_LOCK(sc)		mtx_lock(&(sc)->alx_mtx)
+#define	ALX_UNLOCK(sc)		mtx_unlock(&(sc)->alx_mtx)
+#define	ALX_LOCK_ASSERT(sc)	mtx_assert(&(sc)->alx_mtx, MA_OWNED)
 
 #define ALX_FLAG(_adpt, _FLAG) (\
 	test_bit(ALX_FLAG_##_FLAG, &(_adpt)->flags))
@@ -210,29 +196,5 @@ struct alx_softc {
 
 #define ALX_TX_INC(i, s)	(((i) + 1) % (s)->tx_ringsz)
 #define ALX_TX_DEC(i, s)	(((i) + (s)->tx_ringsz - 1) % (s)->tx_ringsz)
-
-#ifdef notyet
-static inline struct
-alx_rx_queue *alx_hw_rxq(struct alx_rx_queue *rxq)
-{
-	struct alx_adapter *adpt = netdev_priv(rxq->netdev);
-
-	return (ALX_CAP(&adpt->hw, MRQ) ? rxq : adpt->qnapi[0]->rxq);
-}
-
-/* needed by alx_ethtool.c */
-extern void alx_configure(struct alx_adapter *adpt);
-extern void alx_free_all_ring_resources(struct alx_adapter *adpt);
-extern int alx_setup_all_ring_resources(struct alx_adapter *adpt);
-extern void alx_init_def_rss_idt(struct alx_adapter *adpt);
-extern int alx_alloc_rxring_buf(struct alx_adapter *adpt,
-				struct alx_rx_queue *rxq);
-extern void alx_init_intr(struct alx_adapter *adpt);
-extern void alx_disable_advanced_intr(struct alx_adapter *adpt);
-extern void alx_reinit(struct alx_adapter *adpt, bool in_task);
-extern void alx_set_ethtool_ops(struct net_device *dev);
-extern char alx_drv_name[];
-extern char alx_drv_version[];
-#endif
 
 #endif
