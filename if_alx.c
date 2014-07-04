@@ -641,7 +641,9 @@ alx_rxintr(struct alx_softc *sc)
 
 	count = 0;
 	rrd_cidx = sc->alx_rx_queue.cidx;
+#if 0
 	printf("consuming packets starting at %d\n", rrd_cidx);
+#endif
 	while (1) {
 		rrd = &sc->alx_rx_queue.rrd_hdr[rrd_cidx];
 		if ((rrd->word3 & (1 << RRD_UPDATED_SHIFT)) == 0)
@@ -669,7 +671,9 @@ alx_rxintr(struct alx_softc *sc)
 		m->m_pkthdr.len = m->m_len;
 		m->m_pkthdr.rcvif = ifp;
 
+#if 0
 		printf("read a %d-byte packet\n", m->m_len);
+#endif
 
 		/* Pass the packet up the stack. */
 		ALX_UNLOCK(sc);
@@ -681,7 +685,9 @@ alx_rxintr(struct alx_softc *sc)
 			rrd_cidx = 0;
 	}
 
+#if 0
 	printf("consumed %d packets\n", count);
+#endif
 
 	if (count > 0) {
 		sc->alx_rx_queue.cidx = rrd_cidx;
@@ -689,7 +695,9 @@ alx_rxintr(struct alx_softc *sc)
 		/* Refresh mbufs. */
 		rrd_pidx = sc->alx_rx_queue.pidx;
 		while (rrd_pidx != rrd_cidx) {
+#if 0
 			printf("refreshing mbuf at %d\n", rrd_pidx);
+#endif
 			if (alx_newbuf(sc, rrd_pidx) != 0)
 				break;
 			if (++rrd_pidx == sc->rx_ringsz)
@@ -720,7 +728,9 @@ alx_txintr(struct alx_softc *sc)
 	tpd_cidx = sc->alx_tx_queue.cidx;
 	ALX_MEM_R16(&sc->hw, ALX_TPD_PRI0_CIDX, &tpd_hw_cidx);
 
+#if 0
 	printf("in txintr cidx is %d, hw_cidx is %d\n", tpd_cidx, tpd_hw_cidx);
+#endif
 
 	while (tpd_cidx != tpd_hw_cidx) {
 		tx_buf = &sc->alx_tx_queue.bf_info[tpd_cidx];
@@ -1003,7 +1013,9 @@ alx_int_task(void *context, int pending __unused)
 {
 	struct alx_softc *sc;
 
+#if 0
 	printf("in alx_int_task\n");
+#endif
 
 	sc = context;
 
@@ -1051,7 +1063,9 @@ alx_intr_legacy(void *arg)
 	if (intr & ALX_ISR_DIS || (intr & hw->imask) == 0)
 		return (FILTER_STRAY);
 
+#if 0
 	printf("intr is 0x%x, imask is 0x%x\n", intr, hw->imask);
+#endif
 
 	/* Acknowledge and disable interrupts. */
 	ALX_MEM_W32(hw, ALX_ISR, intr | ALX_ISR_DIS);
@@ -1315,8 +1329,10 @@ alx_init_locked(struct alx_softc *sc)
 	alx_init_rx_ring(sc);
 	alx_init_tx_ring(sc);
 
+#if 0
 	printf("rfd: 0x%lx, rrd: 0x%lx, txd: 0x%lx\n", sc->alx_rx_queue.rfd_dma,
 	    sc->alx_rx_queue.rrd_dma, sc->alx_tx_queue.tpd_dma);
+#endif
 
 	/* Load the DMA pointers. */
 	ALX_MEM_W32(hw, ALX_SRAM9, ALX_SRAM_LOAD_PTR);
@@ -1535,7 +1551,9 @@ alx_attach(device_t dev)
 	hw->mtu = sc->alx_ifp->if_mtu;
 	//sc->rxbuf_size = MCLBYTES;
 	sc->rxbuf_size = ALIGN(ALX_RAW_MTU(hw->mtu));
+#if 0
 	printf("rxbuf size is %d\n", sc->rxbuf_size);
+#endif
 fail:
 	if (error != 0)
 		alx_detach(dev);
