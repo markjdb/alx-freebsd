@@ -71,6 +71,9 @@ static struct alx_dev {
 	    "Qualcomm Atheros AR8171 Gigabit Ethernet" },
 	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8172,
 	    "Qualcomm Atheros AR8172 Fast Ethernet" },
+	{ ALX_VENDOR_ID, ALX_DEV_ID_KI2201,
+			"Qualcomm Atheros Killer E2201 Gigabit Ethernet"
+	},
 };
 
 static int	alx_attach(device_t);
@@ -458,6 +461,7 @@ alx_identify_hw(struct alx_softc *sc)
 	case ALX_DEV_ID_AR8162:
 	case ALX_DEV_ID_AR8171:
 	case ALX_DEV_ID_AR8172:
+	case ALX_DEV_ID_KI2201:
 		if (rev > ALX_REV_C0)
 			break;
 		ALX_CAP_SET(hw, L0S);
