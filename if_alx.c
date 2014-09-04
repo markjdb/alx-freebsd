@@ -72,7 +72,7 @@ static struct alx_dev {
 	{ ALX_VENDOR_ID, ALX_DEV_ID_AR8172,
 	    "Qualcomm Atheros AR8172 Fast Ethernet" },
 	{ ALX_VENDOR_ID, ALX_DEV_ID_KI2201,
-			"Qualcomm Atheros Killer E2201 Gigabit Ethernet"
+	    "Qualcomm Atheros Killer E2201 Gigabit Ethernet"
 	},
 };
 
