@@ -1,0 +1,8 @@
+This driver is obsolete. Support for AR816* and AR817* chipsets is now
+available in the alc(4) driver as of
+
+r272730 (head)
+r273366 (stable/10)
+r273367 (stable/9)
+
+Enjoy!
