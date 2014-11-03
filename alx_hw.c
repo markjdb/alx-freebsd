@@ -42,13 +42,8 @@
 #define ALX_REV_A(_r) ((_r) == ALX_REV_A0 || (_r) == ALX_REV_A1)
 
 void	alx_enable_osc(struct alx_hw *hw);
-int	alx_get_perm_macaddr(struct alx_hw *hw, u8 *addr);
 u16	alx_get_phy_config(struct alx_hw *hw);
-bool	alx_get_phy_info(struct alx_hw *hw);
-void	alx_patch_assign(struct alx_hw *hw);
 void	alx_reset_osc(struct alx_hw *hw, u8 rev);
-void	alx_set_macaddr(struct alx_hw *hw, u8 *addr);
-int	alx_write_phy_reg(struct alx_hw *hw, u16 reg, u16 phy_data);
 
 int	__alx_read_phy_core(struct alx_hw *hw, bool ext, u8 dev, u16 reg,
 	    u16 *phy_data);

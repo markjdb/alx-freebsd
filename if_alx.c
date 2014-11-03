@@ -801,7 +801,7 @@ alx_xmit(struct alx_softc *sc, struct mbuf **m_head)
 	struct mbuf *m;
 	bus_dma_segment_t segs[32];
 	bus_dmamap_t txmap;
-	struct tpd_desc *td;
+	struct tpd_desc *td = NULL;
 	struct alx_buffer *tx_buf, *tx_buf_mapped;
 	int desci, error, nsegs, i;
 	uint16_t cidx;
