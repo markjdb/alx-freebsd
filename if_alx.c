@@ -105,7 +105,9 @@ static void	alx_reset(struct alx_softc *sc);
 static void	alx_update_link(struct alx_softc *);
 
 static int	alx_dma_alloc(struct alx_softc *);
+#if 0
 static void	alx_dma_free(struct alx_softc *);
+#endif
 static void	alx_dmamap_cb(void *, bus_dma_segment_t *, int, int);
 
 static void	alx_init_rx_ring(struct alx_softc *);
@@ -399,11 +401,13 @@ alx_dma_alloc(struct alx_softc *sc)
 	return (error);
 }
 
+#if 0
 static void __unused
 alx_dma_free(struct alx_softc *sc)
 {
 
 }
+#endif
 
 static void
 alx_intr_enable(struct alx_softc *sc)
